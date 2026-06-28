@@ -1,3 +1,4 @@
+import os
 from uuid import UUID
 from pathlib import Path
 from html import escape
@@ -21,7 +22,7 @@ from response_chemas import (
     RunSessionInfoOut,
     UnanalyzedRunSessionInfoOut,
 )
-
+from utils.report_generator import generate_pdf_report
 
 router = APIRouter()
 
@@ -200,6 +201,111 @@ def _sample(values: list[float], max_points: int) -> list[float]:
         return values
     step = max(1, len(values) // max_points)
     return values[::step]
+
+
+@router.delete("/run_session/{run_session_id}")
+async def delete_run_session(run_session_id: UUID, session: AsyncSession = Depends(get_session)):
+    import shutil
+    from db_models import AnalysisMeta
+
+    run_session = (await session.execute(
+        select(RunSession)
+        .where(RunSession.id == run_session_id)
+        .options(selectinload(RunSession.videos))
+    )).scalars().first()
+
+    if not run_session:
+        raise HTTPException(status_code=404, detail="Run session not found")
+
+    # 1. Delete original camera video files on disk
+    for video in run_session.videos:
+        if video.video_path and os.path.exists(video.video_path):
+            try:
+                os.remove(video.video_path)
+            except Exception:
+                pass
+
+    # 2. Delete result directory on disk (which has CSVs, generated charts, and report PDF)
+    if run_session.result_dir and os.path.exists(run_session.result_dir):
+        try:
+            shutil.rmtree(run_session.result_dir)
+        except Exception:
+            pass
+
+    # 3. Clean up database entries
+    # Delete related analysis_meta row
+    analysis = (await session.execute(
+        select(AnalysisMeta).where(AnalysisMeta.run_session_id == run_session_id)
+    )).scalars().first()
+    if analysis:
+        await session.delete(analysis)
+
+    # Delete related video rows
+    for video in run_session.videos:
+        await session.delete(video)
+
+    # Delete the run session row
+    await session.delete(run_session)
+
+    await session.commit()
+    return {"status": "success", "message": "Run session deleted successfully"}
+
+@router.delete("/runner/{runner_id}")
+async def delete_runner(runner_id: UUID, session: AsyncSession = Depends(get_session)):
+    import shutil
+    from db_models import RunSession, AnalysisMeta, Video
+
+    # 1. Fetch runner
+    runner = (await session.execute(
+        select(Runner).where(Runner.id == runner_id)
+    )).scalars().first()
+
+    if not runner:
+        raise HTTPException(status_code=404, detail="Runner not found")
+
+    # 2. Fetch all run sessions for this runner
+    runs = (await session.execute(
+        select(RunSession)
+        .where(RunSession.runner_id == runner_id)
+        .options(selectinload(RunSession.videos))
+    )).scalars().all()
+
+    # 3. For each run session, delete files and DB child entries
+    for run in runs:
+        # Delete original camera video files on disk
+        for video in run.videos:
+            if video.video_path and os.path.exists(video.video_path):
+                try:
+                    os.remove(video.video_path)
+                except Exception:
+                    pass
+
+        # Delete result directory on disk
+        if run.result_dir and os.path.exists(run.result_dir):
+            try:
+                shutil.rmtree(run.result_dir)
+            except Exception:
+                pass
+
+        # Delete related analysis_meta row
+        analysis = (await session.execute(
+            select(AnalysisMeta).where(AnalysisMeta.run_session_id == run.id)
+        )).scalars().first()
+        if analysis:
+            await session.delete(analysis)
+
+        # Delete related video rows
+        for video in run.videos:
+            await session.delete(video)
+
+        # Delete the run session row
+        await session.delete(run)
+
+    # 4. Delete the runner row
+    await session.delete(runner)
+
+    await session.commit()
+    return {"status": "success", "message": "Runner and all associated sessions deleted successfully"}
 
 
 def build_graph(
@@ -774,3 +880,61 @@ async def get_run_session_video(run_session_id: UUID, session: AsyncSession = De
 @router.get("/temp_video/{temp_video_id}/thumbnail")
 def get_thumbnail(temp_video_id: str):
     return FileResponse(TEMP_UPLOAD_DIR / f"{temp_video_id}.jpg")
+
+
+@router.get("/run_session/{run_session_id}/csv")
+async def get_run_session_csv(
+    run_session_id: UUID,
+    session: AsyncSession = Depends(get_session),
+) -> FileResponse:
+    run_session = await _get_run_session(run_session_id, session)
+    _, angles_csv = _analysis_csvs(run_session)
+    if not angles_csv:
+        raise HTTPException(status_code=404, detail="CSV file not found")
+
+    return FileResponse(
+        angles_csv,
+        media_type="text/csv",
+        filename=f"angles_{run_session_id}.csv",
+    )
+
+
+@router.get("/run_session/{run_session_id}/pdf")
+async def get_run_session_pdf(
+    run_session_id: UUID,
+    session: AsyncSession = Depends(get_session),
+) -> FileResponse:
+    run_session = await _get_run_session(run_session_id, session, load_analysis=True)
+    results_dir = _session_dir(run_session)
+    pdf_path = results_dir / "report.pdf"
+
+    # Generate if not cached
+    if not pdf_path.exists():
+        if run_session.status != "done" or not run_session.analysis:
+            raise HTTPException(status_code=400, detail="Run session is not fully analyzed yet")
+
+        # Prepare session info dict
+        run_session_info = {
+            "id": str(run_session_id),
+            "runnerName": run_session.runner.name,
+            "date": run_session.date,
+            "fps": run_session.fps,
+            "cameraCount": run_session.camera_count,
+            "totalTime": run_session.analysis.total_time,
+            "avgVelocity": run_session.analysis.avg_velocity,
+            "avgAcceleration": run_session.analysis.avg_acceleration,
+            "avgStepLength": run_session.analysis.avg_step_length,
+            "note": run_session.note,
+            "status": run_session.status,
+        }
+
+        try:
+            generate_pdf_report(run_session_info, str(results_dir), str(pdf_path))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to generate PDF: {str(e)}")
+
+    return FileResponse(
+        pdf_path,
+        media_type="application/pdf",
+        filename=f"Runner_Analysis_Report_{run_session_id}.pdf",
+    )
