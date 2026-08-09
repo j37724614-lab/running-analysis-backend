@@ -5,6 +5,7 @@ from routes.upload import router as upload_router
 from routes.record import router as record_router
 from routes.point_picker import router as point_picker_router
 from routes.trial_review import router as trial_review_router
+from routes.auth import router as auth_router
 from db.init_db import init_db
 from config import API_PREFIX
 
@@ -21,6 +22,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(auth_router, prefix=API_PREFIX)
 app.include_router(run_router, prefix=API_PREFIX)
 app.include_router(upload_router, prefix=API_PREFIX)
 app.include_router(record_router, prefix=API_PREFIX)

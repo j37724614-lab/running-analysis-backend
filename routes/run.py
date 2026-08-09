@@ -13,7 +13,8 @@ import pandas as pd
 
 from config import RUN_SESSION_DIR, TEMP_UPLOAD_DIR
 from db.session import get_session
-from db_models import Runner, RunSession
+from db_models import Runner, RunSession, User
+from routes.auth import get_current_user
 from response_chemas import (
     AddRunnerIn,
     AnglesOut,
@@ -28,8 +29,13 @@ router = APIRouter()
 
 
 @router.get("/runner", response_model=list[RunnerInfoOut])
-async def get_runners(session: AsyncSession = Depends(get_session)) -> list[RunnerInfoOut]:
-    runners = (await session.execute(select(Runner))).scalars().all()
+async def get_runners(
+    session: AsyncSession = Depends(get_session),
+    current_user: User = Depends(get_current_user)
+) -> list[RunnerInfoOut]:
+    runners = (await session.execute(
+        select(Runner).where(Runner.user_id == current_user.id)
+    )).scalars().all()
     result = []
 
     for runner in runners:
@@ -57,8 +63,9 @@ async def get_runners(session: AsyncSession = Depends(get_session)) -> list[Runn
 async def add_runner(
     data: AddRunnerIn,
     session: AsyncSession = Depends(get_session),
+    current_user: User = Depends(get_current_user),
 ) -> dict:
-    runner = Runner(name=data.name)
+    runner = Runner(name=data.name, user_id=current_user.id)
     session.add(runner)
     await session.commit()
     await session.refresh(runner)
@@ -72,7 +79,14 @@ async def add_runner(
 async def get_runner_run_sessions(
     runner_id: UUID,
     session: AsyncSession = Depends(get_session),
+    current_user: User = Depends(get_current_user),
 ) -> list[RunSessionInfoOut]:
+    runner = (await session.execute(
+        select(Runner).where(Runner.id == runner_id).where(Runner.user_id == current_user.id)
+    )).scalars().first()
+    if not runner:
+        raise HTTPException(status_code=404, detail="Runner not found or unauthorized")
+
     runs = (await session.execute(
         select(RunSession)
         .where(RunSession.runner_id == runner_id)
@@ -113,7 +127,14 @@ async def get_runner_run_sessions(
 async def get_unanalyzed_run_sessions(
     runner_id: UUID,
     session: AsyncSession = Depends(get_session),
+    current_user: User = Depends(get_current_user),
 ) -> list[UnanalyzedRunSessionInfoOut]:
+    runner = (await session.execute(
+        select(Runner).where(Runner.id == runner_id).where(Runner.user_id == current_user.id)
+    )).scalars().first()
+    if not runner:
+        raise HTTPException(status_code=404, detail="Runner not found or unauthorized")
+
     runs = (await session.execute(
         select(RunSession)
         .where(RunSession.runner_id == runner_id)
@@ -146,7 +167,11 @@ async def get_unanalyzed_run_sessions(
 
 
 @router.get("/run_session/{run_session_id}")
-async def get_run_session_info(run_session_id: UUID, session: AsyncSession = Depends(get_session)) -> RunSessionInfoOut:
+async def get_run_session_info(
+    run_session_id: UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: User = Depends(get_current_user)
+) -> RunSessionInfoOut:
     run_session = (await session.execute(
         select(RunSession)
         .where(RunSession.id == run_session_id)
@@ -155,8 +180,8 @@ async def get_run_session_info(run_session_id: UUID, session: AsyncSession = Dep
             selectinload(RunSession.analysis),
         )
     )).scalars().first()
-    if not run_session:
-        raise HTTPException(status_code=404, detail="Run session not found")
+    if not run_session or run_session.runner.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Run session not found or unauthorized")
 
     if run_session.status != "done" or run_session.analysis is None:
         return RunSessionInfoOut(
@@ -204,18 +229,25 @@ def _sample(values: list[float], max_points: int) -> list[float]:
 
 
 @router.delete("/run_session/{run_session_id}")
-async def delete_run_session(run_session_id: UUID, session: AsyncSession = Depends(get_session)):
+async def delete_run_session(
+    run_session_id: UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: User = Depends(get_current_user)
+):
     import shutil
     from db_models import AnalysisMeta
 
     run_session = (await session.execute(
         select(RunSession)
         .where(RunSession.id == run_session_id)
-        .options(selectinload(RunSession.videos))
+        .options(
+            selectinload(RunSession.runner),
+            selectinload(RunSession.videos)
+        )
     )).scalars().first()
 
-    if not run_session:
-        raise HTTPException(status_code=404, detail="Run session not found")
+    if not run_session or run_session.runner.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Run session not found or unauthorized")
 
     # 1. Delete original camera video files on disk
     for video in run_session.videos:
@@ -251,13 +283,17 @@ async def delete_run_session(run_session_id: UUID, session: AsyncSession = Depen
     return {"status": "success", "message": "Run session deleted successfully"}
 
 @router.delete("/runner/{runner_id}")
-async def delete_runner(runner_id: UUID, session: AsyncSession = Depends(get_session)):
+async def delete_runner(
+    runner_id: UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: User = Depends(get_current_user)
+):
     import shutil
     from db_models import RunSession, AnalysisMeta, Video
 
     # 1. Fetch runner
     runner = (await session.execute(
-        select(Runner).where(Runner.id == runner_id)
+        select(Runner).where(Runner.id == runner_id).where(Runner.user_id == current_user.id)
     )).scalars().first()
 
     if not runner:
@@ -439,8 +475,14 @@ def _with_time_column(df: pd.DataFrame, fps: int) -> pd.DataFrame:
     "/run_session/{run_session_id}/graphs",
     response_model=list[GraphOut],
 )
-async def get_run_session_graphs(run_session_id: UUID, session: AsyncSession = Depends(get_session)):
-    run_session = await _get_run_session(run_session_id, session)
+async def get_run_session_graphs(
+    run_session_id: UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    run_session = await _get_run_session(run_session_id, session, load_analysis=True)
+    if run_session.runner.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Run session not found or unauthorized")
     graphs = []
     metrics_csv, angles_csv = _analysis_csvs(run_session)
 
@@ -840,14 +882,18 @@ async def download_run_session_report(
 
 
 @router.get("/run_session/{run_session_id}/video")
-async def get_run_session_video(run_session_id: UUID, session: AsyncSession = Depends(get_session)) -> FileResponse:
+async def get_run_session_video(
+    run_session_id: UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: User = Depends(get_current_user)
+) -> FileResponse:
     run_session = (await session.execute(
         select(RunSession)
-        .options(selectinload(RunSession.analysis))
+        .options(selectinload(RunSession.runner), selectinload(RunSession.analysis))
         .where(RunSession.id == run_session_id)
     )).scalars().first()
-    if not run_session:
-        raise HTTPException(status_code=404, detail="Run session not found")
+    if not run_session or run_session.runner.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Run session not found or unauthorized")
 
     video_path = None
     if run_session.analysis and isinstance(run_session.analysis.summary, dict):
@@ -878,16 +924,21 @@ async def get_run_session_video(run_session_id: UUID, session: AsyncSession = De
 
 
 @router.get("/temp_video/{temp_video_id}/thumbnail")
-def get_thumbnail(temp_video_id: str):
+def get_thumbnail(
+    temp_video_id: str,
+    current_user: User = Depends(get_current_user),
+):
     return FileResponse(TEMP_UPLOAD_DIR / f"{temp_video_id}.jpg")
-
 
 @router.get("/run_session/{run_session_id}/csv")
 async def get_run_session_csv(
     run_session_id: UUID,
     session: AsyncSession = Depends(get_session),
+    current_user: User = Depends(get_current_user),
 ) -> FileResponse:
-    run_session = await _get_run_session(run_session_id, session)
+    run_session = await _get_run_session(run_session_id, session, load_analysis=True)
+    if run_session.runner.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Run session not found or unauthorized")
     _, angles_csv = _analysis_csvs(run_session)
     if not angles_csv:
         raise HTTPException(status_code=404, detail="CSV file not found")
@@ -903,8 +954,11 @@ async def get_run_session_csv(
 async def get_run_session_pdf(
     run_session_id: UUID,
     session: AsyncSession = Depends(get_session),
+    current_user: User = Depends(get_current_user),
 ) -> FileResponse:
     run_session = await _get_run_session(run_session_id, session, load_analysis=True)
+    if run_session.runner.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Run session not found or unauthorized")
     results_dir = _session_dir(run_session)
     pdf_path = results_dir / "report.pdf"
 

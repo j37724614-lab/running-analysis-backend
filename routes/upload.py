@@ -16,7 +16,8 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.session import get_session, async_session
-from db_models import RunSession, AnalysisMeta, Video
+from db_models import RunSession, AnalysisMeta, Video, User, Runner
+from routes.auth import get_current_user
 from config import ENABLE_MOCK_ON_FAILURE, PIPELINE_ROOT, RUN_SESSION_DIR, TEMP_UPLOAD_DIR
 from response_chemas import (
     UploadSeperatelyStatus,
@@ -308,6 +309,7 @@ async def analyze_and_save(runner_id: str, run_session_id: str, camera_count: in
 async def upload_video(
     index: int,
     file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user)
 ):
     base_id = uuid.uuid4().hex[:8]
     temp_video_id = f"{base_id}_cam{index + 1}"
@@ -339,7 +341,15 @@ async def upload_video(
 async def upload_all_info(
     req: UploadAllRequest,
     session: AsyncSession = Depends(get_session),
+    current_user: User = Depends(get_current_user),
 ):
+    # Verify runner belongs to current user
+    runner = (await session.execute(
+        select(Runner).where(Runner.id == UUID(req.runnerId)).where(Runner.user_id == current_user.id)
+    )).scalars().first()
+    if not runner:
+        raise HTTPException(status_code=404, detail="Runner not found or unauthorized")
+
     runSession = RunSession(
         runner_id=UUID(req.runnerId),
         date=datetime.strptime(req.date, "%Y-%m-%d %H:%M:%S"),
@@ -391,7 +401,15 @@ async def upload_all_info(
 async def upload_seperately_new(
     req: UploadSeperatelyNewRequest,
     session: AsyncSession = Depends(get_session),
+    current_user: User = Depends(get_current_user),
 ) -> UploadSeperatelyStatus:
+    # Verify runner belongs to current user
+    runner = (await session.execute(
+        select(Runner).where(Runner.id == UUID(req.runnerId)).where(Runner.user_id == current_user.id)
+    )).scalars().first()
+    if not runner:
+        raise HTTPException(status_code=404, detail="Runner not found or unauthorized")
+
     runSession = RunSession(
         runner_id=UUID(req.runnerId),
         date=datetime.strptime(req.date, "%Y-%m-%d %H:%M:%S"),
@@ -454,7 +472,15 @@ async def upload_seperately_new(
 async def upload_seperately_select(
     req: UploadSeperatelySelectRequest,
     session: AsyncSession = Depends(get_session),
+    current_user: User = Depends(get_current_user),
 ) -> UploadSeperatelyStatus:
+    # Verify runner belongs to current user
+    runner = (await session.execute(
+        select(Runner).where(Runner.id == UUID(req.runnerId)).where(Runner.user_id == current_user.id)
+    )).scalars().first()
+    if not runner:
+        raise HTTPException(status_code=404, detail="Runner not found or unauthorized")
+
     stored_path = move_temp_video_and_del_thumbnail(
         req.tempVideoId,
         req.runnerId,
