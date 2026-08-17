@@ -182,6 +182,71 @@ async def record_websocket(websocket: WebSocket):
                             except Exception:
                                 pass
 
+            elif msg_type == "requestControl":
+                if current_room and current_member:
+                    master_member = next((m for m in current_room.members if m.is_master), None)
+                    if not master_member:
+                        # 房主不存在，直接成為房主
+                        current_member.is_master = True
+                        await websocket.send_json({
+                            "type": "controlGranted",
+                            "data": {}
+                        })
+                        await current_room.broadcast_status()
+                    else:
+                        # 房主存在，轉發請求給目前房主
+                        try:
+                            await master_member.ws.send_json({
+                                "type": "controlRequest",
+                                "data": {
+                                    "requesterId": current_member.id,
+                                    "cameraIndex": current_member.camera_index
+                                }
+                            })
+                        except Exception:
+                            # 房主 websocket 連線異常，直接將控制權給 requester
+                            master_member.is_master = False
+                            current_member.is_master = True
+                            await websocket.send_json({
+                                "type": "controlGranted",
+                                "data": {}
+                            })
+                            await current_room.broadcast_status()
+
+            elif msg_type == "respondControlRequest":
+                if current_room and current_member and current_member.is_master:
+                    requester_id = msg_data.get("requesterId")
+                    agree = msg_data.get("agree", False)
+                    requester = next((m for m in current_room.members if m.id == requester_id), None)
+                    if requester:
+                        if agree:
+                            # 交換控制權
+                            current_member.is_master = False
+                            requester.is_master = True
+                            
+                            # 通知請求者與原房主
+                            try:
+                                await requester.ws.send_json({
+                                    "type": "controlGranted",
+                                    "data": {}
+                                })
+                            except Exception:
+                                pass
+                            await websocket.send_json({
+                                "type": "controlRevoked",
+                                "data": {}
+                            })
+                            await current_room.broadcast_status()
+                        else:
+                            # 拒絕請求，通知請求者
+                            try:
+                                await requester.ws.send_json({
+                                    "type": "controlRejected",
+                                    "data": {"message": "房主拒絕了您的主控權要求"}
+                                })
+                            except Exception:
+                                pass
+
     except WebSocketDisconnect:
         if current_room and current_member in current_room.members:
             current_room.members.remove(current_member)

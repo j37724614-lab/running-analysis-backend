@@ -136,3 +136,9 @@ async def login(
         data={"sub": user.username}, expires_delta=access_token_expires
     )
     return TokenOut(access_token=access_token, token_type="bearer")
+
+@router.get("/verify", response_model=dict)
+async def verify(
+    current_user: User = Depends(get_current_user)
+):
+    return {"status": "ok", "username": current_user.username}
