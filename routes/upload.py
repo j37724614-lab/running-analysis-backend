@@ -29,7 +29,7 @@ from response_chemas import (
 pipeline_dir = str(PIPELINE_ROOT)
 if pipeline_dir not in sys.path:
     sys.path.insert(0, pipeline_dir)
-from core.pipeline import run_analysis
+from core.pipeline import run_analysis, AnalysisOptions, PoseScope, TrackedVideoSource
 
 
 router = APIRouter()
@@ -232,14 +232,20 @@ async def analyze_and_save(runner_id: str, run_session_id: str, camera_count: in
             with open(os.path.join(folder, "metadata.json"), "w") as f:
                 json.dump(meta_data, f, indent=4)
 
+            # core/pipeline.py's run_analysis() was refactored (today's
+            # "clean code" pass on the pipeline repo) to take a single
+            # AnalysisOptions object instead of individual gpu/only_2d/
+            # skip_track/output_dest/progress_callback keyword args.
             raw_data = await asyncio.to_thread(
                 run_analysis,
-                config_dict=config_dict,
-                gpu="0",
-                only_2d=False,
-                skip_track=False,
-                output_dest=folder,
-                progress_callback=progress_callback,
+                config_dict,
+                AnalysisOptions(
+                    gpu="0",
+                    pose_scope=PoseScope.TWO_D_AND_3D,
+                    tracked_video_source=TrackedVideoSource.GENERATE,
+                    output_dest=folder,
+                    progress_callback=progress_callback,
+                ),
             )
 
             metrics_csv = raw_data.get("metrics_csv") if raw_data else None
