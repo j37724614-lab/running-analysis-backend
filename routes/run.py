@@ -99,6 +99,7 @@ async def get_runner_run_sessions(
                 totalTime=round(run.analysis.total_time, 3) if run.analysis and run.analysis.total_time is not None else None,
                 status=run.status,
                 progress=run.progress,
+                isLongJump=run.is_long_jump,
             )
         )
     return result
@@ -167,6 +168,7 @@ async def get_run_session_info(run_session_id: UUID, session: AsyncSession = Dep
             note=run_session.note,
             status=run_session.status,
             progress=run_session.progress,
+            isLongJump=run_session.is_long_jump,
         )
 
     analysis = run_session.analysis
@@ -180,6 +182,7 @@ async def get_run_session_info(run_session_id: UUID, session: AsyncSession = Dep
         note=run_session.note,
         status=run_session.status,
         progress=run_session.progress,
+        isLongJump=run_session.is_long_jump,
         totalTime=round(analysis.total_time, 3) if analysis.total_time is not None else None,
         avgVelocity=round(analysis.avg_velocity, 3) if analysis.avg_velocity is not None else None,
         avgAcceleration=round(analysis.avg_acceleration, 3) if analysis.avg_acceleration is not None else None,

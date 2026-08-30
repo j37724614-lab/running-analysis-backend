@@ -3,6 +3,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from routes.run import router as run_router
 from routes.upload import router as upload_router
 from routes.record import router as record_router
+from routes.point_picker import router as point_picker_router
+from routes.trial_review import router as trial_review_router
 from db.init_db import init_db
 from config import API_PREFIX
 
@@ -22,6 +24,8 @@ app.add_middleware(
 app.include_router(run_router, prefix=API_PREFIX)
 app.include_router(upload_router, prefix=API_PREFIX)
 app.include_router(record_router, prefix=API_PREFIX)
+app.include_router(point_picker_router, prefix=API_PREFIX)
+app.include_router(trial_review_router, prefix=API_PREFIX)
 
 @app.on_event("startup")
 async def on_startup():

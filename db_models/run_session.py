@@ -18,6 +18,10 @@ class RunSession(SQLModel, table=True):
     fps: int = Field(default=60)
     camera_count: int = Field(default=5)
     note: str = Field(default="")
+    is_long_jump: bool = Field(
+        default=False,
+        description="Whether this run session is a long-jump trial (enables long_jump_final_landing in the pipeline config)"
+    )
 
     status: str = Field(
         default="pending",

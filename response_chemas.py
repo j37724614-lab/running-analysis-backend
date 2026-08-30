@@ -29,6 +29,7 @@ class RunSessionInfoOut(BaseModel):
     note: str
     status: str
     progress: int = 0
+    isLongJump: bool = False
 
 
 class UnanalyzedRunSessionInfoOut(BaseModel):
@@ -72,12 +73,14 @@ class AnglesOut(BaseModel):
 class AnchorPointIn(BaseModel):
     x: float
     y: float
+    world_x_m: Optional[float] = None
+    world_y_m: Optional[float] = None
 
 
 class AnchorResultIn(BaseModel):
     points: list[AnchorPointIn]
-    topDistanceM: float
-    bottomDistanceM: float
+    topDistanceM: Optional[float] = None
+    bottomDistanceM: Optional[float] = None
 
 
 class UploadVideoInfoIn(BaseModel):
@@ -92,6 +95,7 @@ class UploadAllRequest(BaseModel):
     cameraCount: int
     note: str
     videos: list[UploadVideoInfoIn]
+    isLongJump: bool = False
 
 
 class UploadSeperatelyStatus(BaseModel):
@@ -110,6 +114,7 @@ class UploadSeperatelyNewRequest(BaseModel):
     cameraIndex: int
     tempVideoId: str
     anchors: Optional[AnchorResultIn] = None
+    isLongJump: bool = False
 
 
 class UploadSeperatelySelectRequest(BaseModel):
@@ -118,3 +123,43 @@ class UploadSeperatelySelectRequest(BaseModel):
     cameraIndex: int
     tempVideoId: str
     anchors: Optional[AnchorResultIn] = None
+
+
+class StepSampleOut(BaseModel):
+    stepIndex: int
+    timeSec: float
+    cam: int
+    foot: Optional[str] = None
+    eventType: Optional[str] = None
+    stepLengthM: Optional[float] = None
+    cadenceSpm: Optional[float] = None
+    velocityMps: Optional[float] = None
+    worldXM: Optional[float] = None
+    worldYM: Optional[float] = None
+
+
+class StepsOut(BaseModel):
+    avgStepLengthM: Optional[float] = None
+    avgCadenceSpm: Optional[float] = None
+    steps: list[StepSampleOut]
+
+
+class ToePointOut(BaseModel):
+    x: float
+    y: float
+    worldXM: Optional[float] = None
+    worldYM: Optional[float] = None
+    score: float
+
+
+class ToePathFrameOut(BaseModel):
+    seqFrame: int
+    origFrame: int
+    timeSec: float
+    points: dict[str, ToePointOut]
+
+
+class ToePathOut(BaseModel):
+    keypointNames: list[str]
+    hasWorldCoords: bool
+    frames: list[ToePathFrameOut]

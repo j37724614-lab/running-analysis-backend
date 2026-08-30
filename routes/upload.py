@@ -72,6 +72,58 @@ def _camera_config_from_anchors(video_path: str, anchors: list[dict], top_distan
     return cam_cfg
 
 
+def _camera_config_from_homography_anchors(video_path: str, anchors: list[dict]) -> dict:
+    """Build a homography-mode cam_cfg from 6 ground-control points.
+
+    Each anchor carries its own world_x_m/world_y_m (unlike the 4-point
+    line-projection mode above). The pipeline's own _track_calibration()
+    already knows how to turn homography_src_points/homography_dst_world
+    into a full 2D homography (see ankle_step_stride.py), so this only
+    needs to assemble those two lists -- no cv2 call here.
+    """
+    cam_cfg = {"video_path": video_path}
+    cap = cv2.VideoCapture(video_path)
+    try:
+        if cap.isOpened():
+            w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+            h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+        else:
+            w = h = 0
+    finally:
+        cap.release()
+
+    if w > 0 and h > 0:
+        src_points = [
+            [float(anchor["x"]) * float(w), float(anchor["y"]) * float(h)]
+            for anchor in anchors
+        ]
+    else:
+        src_points = [[float(anchor["x"]), float(anchor["y"])] for anchor in anchors]
+
+    cam_cfg["homography_src_points"] = src_points
+    cam_cfg["homography_dst_world"] = [
+        [float(anchor["world_x_m"]), float(anchor["world_y_m"])] for anchor in anchors
+    ]
+
+    # Synthesize a start_line/end_line pair from the two points nearest/furthest
+    # along the runway (by world_x_m), so core/tracking.py's existing
+    # start_line/end_line-driven logic -- temporal prescan's valid frame-range
+    # ROI, "stop output past the end line", etc. -- works the same way it does
+    # for the 4-point line-projection mode. distance_m is deliberately left
+    # unset so _track_calibration() still falls through to the homography
+    # distance calculation for step lengths (see _make_calibration()).
+    by_world_x = sorted(zip(anchors, src_points), key=lambda pair: pair[0]["world_x_m"])
+    min_x = by_world_x[0][0]["world_x_m"]
+    max_x = by_world_x[-1][0]["world_x_m"]
+    start_pts = [pt for anchor, pt in by_world_x if anchor["world_x_m"] == min_x]
+    end_pts = [pt for anchor, pt in by_world_x if anchor["world_x_m"] == max_x]
+    if len(start_pts) >= 2 and len(end_pts) >= 2 and min_x != max_x:
+        cam_cfg["start_line"] = start_pts[:2]
+        cam_cfg["end_line"] = end_pts[:2]
+
+    return cam_cfg
+
+
 def move_temp_video_and_del_thumbnail(temp_video_id: str, runner_id: str, run_session_id: str, camera_index: int):
     image_path = os.path.join(TEMP_UPLOAD_DIR, temp_video_id + ".jpg")
     if os.path.exists(image_path):
@@ -129,6 +181,8 @@ async def analyze_and_save(runner_id: str, run_session_id: str, camera_count: in
                 "prescan_enabled": True,
                 "prescan_engine_path": "/home/jeter/runner-analysis-pipeline/models/yolo26x_ultralytics_int8.engine",
             }
+            if run_session.is_long_jump:
+                config_dict["long_jump_final_landing"] = True
             videos_sorted = sorted(videos, key=lambda x: x.camera_index)
             meta_data_cameras = []
 
@@ -142,6 +196,11 @@ async def analyze_and_save(runner_id: str, run_session_id: str, camera_count: in
                         v.top_distance_m,
                         v.bottom_distance_m,
                     )
+                elif anchors and len(anchors) == 6 and all(
+                    a.get("world_x_m") is not None and a.get("world_y_m") is not None
+                    for a in anchors
+                ):
+                    cam_cfg = _camera_config_from_homography_anchors(v.video_path, anchors)
                 config_dict["cameras"].append(cam_cfg)
 
                 meta_data_cameras.append({
@@ -150,6 +209,18 @@ async def analyze_and_save(runner_id: str, run_session_id: str, camera_count: in
                     "top_distance_m": v.top_distance_m,
                     "bottom_distance_m": v.bottom_distance_m,
                 })
+
+            # Use the calibrated world-coordinate speed when every analysed
+            # camera has six valid ground-control points. The pipeline still
+            # writes the legacy pixel series alongside it for comparison.
+            if config_dict["cameras"] and all(
+                len(cam.get("homography_src_points", [])) == 6
+                and len(cam.get("homography_dst_world", [])) == 6
+                for cam in config_dict["cameras"]
+            ):
+                config_dict["speed_mode"] = "homography"
+            else:
+                config_dict["speed_mode"] = "pixel"
 
             meta_data = {
                 "run_session_id": run_session_id,
@@ -175,20 +246,23 @@ async def analyze_and_save(runner_id: str, run_session_id: str, camera_count: in
             avg_velocity = raw_data.get("avg_velocity") if raw_data else None
             avg_acceleration = raw_data.get("avg_acceleration") if raw_data else None
             avg_step_length = raw_data.get("avg_step_length") if raw_data else None
+            if avg_step_length is None:
+                avg_step_length = 0.0
 
-            analysis_meta = AnalysisMeta(
-                run_session_id=UUID(run_session_id),
-                total_time=total_time,
-                avg_velocity=avg_velocity,
-                avg_acceleration=avg_acceleration,
-                avg_step_length=avg_step_length,
-                summary={
-                    "metrics_csv": metrics_csv,
-                    "angles_csv": raw_data.get("angles_csv") if raw_data else None,
-                    "uncropped_video": raw_data.get("uncropped_video") if raw_data else None,
-                },
-            )
-            session.add(analysis_meta)
+            summary = {
+                "metrics_csv": metrics_csv,
+                "angles_csv": raw_data.get("angles_csv") if raw_data else None,
+                "uncropped_video": raw_data.get("uncropped_video") if raw_data else None,
+            }
+            analysis_meta = await session.get(AnalysisMeta, UUID(run_session_id))
+            if analysis_meta is None:
+                analysis_meta = AnalysisMeta(run_session_id=UUID(run_session_id))
+                session.add(analysis_meta)
+            analysis_meta.total_time = total_time
+            analysis_meta.avg_velocity = avg_velocity
+            analysis_meta.avg_acceleration = avg_acceleration
+            analysis_meta.avg_step_length = avg_step_length
+            analysis_meta.summary = summary
             run_session = await session.get(RunSession, UUID(run_session_id))
             run_session.status = "done"
             run_session.progress = 100
@@ -196,6 +270,7 @@ async def analyze_and_save(runner_id: str, run_session_id: str, camera_count: in
             await session.commit()
         except Exception as e:
             print(f"Error during analysis for session {run_session_id}: {e}")
+            await session.rollback()
 
             if ENABLE_MOCK_ON_FAILURE:
                 print(f"Falling back to mock data for session {run_session_id}")
@@ -271,6 +346,7 @@ async def upload_all_info(
         fps=req.fps,
         camera_count=req.cameraCount,
         note=req.note,
+        is_long_jump=req.isLongJump,
     )
     session.add(runSession)
 
@@ -322,6 +398,7 @@ async def upload_seperately_new(
         fps=req.fps,
         camera_count=req.cameraCount,
         note=req.note,
+        is_long_jump=req.isLongJump,
     )
     session.add(runSession)
 

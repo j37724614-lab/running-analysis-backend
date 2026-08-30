@@ -43,8 +43,8 @@ TO_FPS = 60
 TO_HEIGHT = 1080
 
 # tracking setting
-WEIGHTS_DET = "/home/hsuanya/workspace/running_analysis/backend/model/yolo11m.pt"   # ultralytics model name
-WEIGHTS_POSE = "/home/hsuanya/workspace/running_analysis/backend/model/yolo11l-pose.pt"   # ultralytics model name
+WEIGHTS_DET = "yolo11m.pt"   # ultralytics model name (auto-downloads/caches locally)
+WEIGHTS_POSE = "yolo11l-pose.pt"   # ultralytics model name (auto-downloads/caches locally)
 DEVICE = "cuda:0"
 MAX_WORKERS_DET = 4   # Num of cores for tracking - Multiple processing
 MAX_WORKERS_POSE = 2   # Num of cores for pose eatimation - Multiple processing
