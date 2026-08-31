@@ -35,6 +35,20 @@ from core.pipeline import run_analysis, AnalysisOptions, PoseScope, TrackedVideo
 router = APIRouter()
 
 
+def analysis_result_fields(raw_data: dict | None) -> dict:
+    """Preserve unknown pipeline metrics as ``None`` for API consumers."""
+    result = raw_data or {}
+    return {
+        "metrics_csv": result.get("metrics_csv"),
+        "total_time": result.get("total_time"),
+        "avg_velocity": result.get("avg_velocity"),
+        "avg_acceleration": result.get("avg_acceleration"),
+        "avg_step_length": result.get("avg_step_length"),
+        "angles_csv": result.get("angles_csv"),
+        "uncropped_video": result.get("uncropped_video"),
+    }
+
+
 def _camera_config_from_anchors(video_path: str, anchors: list[dict], top_distance_m, bottom_distance_m) -> dict:
     cam_cfg = {"video_path": video_path}
     cap = cv2.VideoCapture(video_path)
@@ -125,6 +139,42 @@ def _camera_config_from_homography_anchors(video_path: str, anchors: list[dict])
     return cam_cfg
 
 
+def camera_config_from_stored_calibration(
+    video_path: str,
+    anchors: list[dict] | None,
+    left_to_mid_distance_m: float | None,
+    mid_to_right_distance_m: float | None,
+) -> dict:
+    """Translate persisted upload calibration into the pipeline camera contract."""
+    if not anchors:
+        return {"video_path": video_path}
+    if len(anchors) == 6 and all(
+        anchor.get("world_x_m") is not None and anchor.get("world_y_m") is not None
+        for anchor in anchors
+    ):
+        return _camera_config_from_homography_anchors(video_path, anchors)
+    if (
+        len(anchors) == 6
+        and left_to_mid_distance_m is not None
+        and mid_to_right_distance_m is not None
+    ):
+        segmented_distance_m = float(left_to_mid_distance_m) + float(mid_to_right_distance_m)
+        return _camera_config_from_anchors(
+            video_path,
+            anchors,
+            segmented_distance_m,
+            segmented_distance_m,
+        )
+    if len(anchors) == 4:
+        return _camera_config_from_anchors(
+            video_path,
+            anchors,
+            left_to_mid_distance_m,
+            mid_to_right_distance_m,
+        )
+    return {"video_path": video_path}
+
+
 def move_temp_video_and_del_thumbnail(temp_video_id: str, runner_id: str, run_session_id: str, camera_index: int):
     image_path = os.path.join(TEMP_UPLOAD_DIR, temp_video_id + ".jpg")
     if os.path.exists(image_path):
@@ -189,19 +239,12 @@ async def analyze_and_save(runner_id: str, run_session_id: str, camera_count: in
 
             for v in videos_sorted:
                 anchors = json.loads(v.anchors) if v.anchors else None
-                cam_cfg = {"video_path": v.video_path}
-                if anchors and len(anchors) == 4:
-                    cam_cfg = _camera_config_from_anchors(
-                        v.video_path,
-                        anchors,
-                        v.top_distance_m,
-                        v.bottom_distance_m,
-                    )
-                elif anchors and len(anchors) == 6 and all(
-                    a.get("world_x_m") is not None and a.get("world_y_m") is not None
-                    for a in anchors
-                ):
-                    cam_cfg = _camera_config_from_homography_anchors(v.video_path, anchors)
+                cam_cfg = camera_config_from_stored_calibration(
+                    v.video_path,
+                    anchors,
+                    v.top_distance_m,
+                    v.bottom_distance_m,
+                )
                 config_dict["cameras"].append(cam_cfg)
 
                 meta_data_cameras.append({
@@ -248,27 +291,21 @@ async def analyze_and_save(runner_id: str, run_session_id: str, camera_count: in
                 ),
             )
 
-            metrics_csv = raw_data.get("metrics_csv") if raw_data else None
-            total_time = raw_data.get("total_time") if raw_data else None
-            avg_velocity = raw_data.get("avg_velocity") if raw_data else None
-            avg_acceleration = raw_data.get("avg_acceleration") if raw_data else None
-            avg_step_length = raw_data.get("avg_step_length") if raw_data else None
-            if avg_step_length is None:
-                avg_step_length = 0.0
+            result_fields = analysis_result_fields(raw_data)
 
             summary = {
-                "metrics_csv": metrics_csv,
-                "angles_csv": raw_data.get("angles_csv") if raw_data else None,
-                "uncropped_video": raw_data.get("uncropped_video") if raw_data else None,
+                "metrics_csv": result_fields["metrics_csv"],
+                "angles_csv": result_fields["angles_csv"],
+                "uncropped_video": result_fields["uncropped_video"],
             }
             analysis_meta = await session.get(AnalysisMeta, UUID(run_session_id))
             if analysis_meta is None:
                 analysis_meta = AnalysisMeta(run_session_id=UUID(run_session_id))
                 session.add(analysis_meta)
-            analysis_meta.total_time = total_time
-            analysis_meta.avg_velocity = avg_velocity
-            analysis_meta.avg_acceleration = avg_acceleration
-            analysis_meta.avg_step_length = avg_step_length
+            analysis_meta.total_time = result_fields["total_time"]
+            analysis_meta.avg_velocity = result_fields["avg_velocity"]
+            analysis_meta.avg_acceleration = result_fields["avg_acceleration"]
+            analysis_meta.avg_step_length = result_fields["avg_step_length"]
             analysis_meta.summary = summary
             run_session = await session.get(RunSession, UUID(run_session_id))
             run_session.status = "done"
@@ -383,8 +420,8 @@ async def upload_all_info(
         bot_d = None
         if info.anchors:
             anchors_json = json.dumps([p.dict() for p in info.anchors.points])
-            top_d = info.anchors.topDistanceM
-            bot_d = info.anchors.bottomDistanceM
+            top_d = info.anchors.leftToMidDistanceM or info.anchors.topDistanceM
+            bot_d = info.anchors.midToRightDistanceM or info.anchors.bottomDistanceM
 
         video = Video(
             run_session_id=runSession.id,
@@ -441,8 +478,8 @@ async def upload_seperately_new(
     bot_d = None
     if req.anchors:
         anchors_json = json.dumps([p.dict() for p in req.anchors.points])
-        top_d = req.anchors.topDistanceM
-        bot_d = req.anchors.bottomDistanceM
+        top_d = req.anchors.leftToMidDistanceM or req.anchors.topDistanceM
+        bot_d = req.anchors.midToRightDistanceM or req.anchors.bottomDistanceM
 
     video = Video(
         run_session_id=runSession.id,
@@ -499,8 +536,8 @@ async def upload_seperately_select(
     bot_d = None
     if req.anchors:
         anchors_json = json.dumps([p.dict() for p in req.anchors.points])
-        top_d = req.anchors.topDistanceM
-        bot_d = req.anchors.bottomDistanceM
+        top_d = req.anchors.leftToMidDistanceM or req.anchors.topDistanceM
+        bot_d = req.anchors.midToRightDistanceM or req.anchors.bottomDistanceM
 
     video = Video(
         run_session_id=UUID(req.runSessionId),

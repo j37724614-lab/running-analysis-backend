@@ -79,8 +79,16 @@ class AnchorPointIn(BaseModel):
 
 class AnchorResultIn(BaseModel):
     points: list[AnchorPointIn]
+    leftToMidDistanceM: Optional[float] = None
+    midToRightDistanceM: Optional[float] = None
     topDistanceM: Optional[float] = None
     bottomDistanceM: Optional[float] = None
+
+    @property
+    def segmentedDistanceM(self) -> Optional[float]:
+        if self.leftToMidDistanceM is None or self.midToRightDistanceM is None:
+            return None
+        return self.leftToMidDistanceM + self.midToRightDistanceM
 
 
 class UploadVideoInfoIn(BaseModel):
