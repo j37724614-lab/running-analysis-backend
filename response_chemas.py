@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Optional, List
 from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class RunnerInfoOut(BaseModel):
@@ -30,6 +30,7 @@ class RunSessionInfoOut(BaseModel):
     status: str
     progress: int = 0
     isLongJump: bool = False
+    computeLocations: List[str] = Field(default_factory=list)
 
 
 class UnanalyzedRunSessionInfoOut(BaseModel):
@@ -171,3 +172,33 @@ class ToePathOut(BaseModel):
     keypointNames: list[str]
     hasWorldCoords: bool
     frames: list[ToePathFrameOut]
+
+
+class CreateLocalAnalysisRunIn(BaseModel):
+    """Creates a new RunSession + its 'local' AnalysisRun (規劃書 Step 10)."""
+
+    runnerId: UUID
+    date: Optional[datetime] = None
+    cameraCount: int = 1
+    fps: int = 60
+    isLongJump: bool = False
+    note: str = ""
+    comparisonGroupId: Optional[UUID] = None
+
+
+class CreateLocalAnalysisRunOut(BaseModel):
+    runSessionId: UUID
+    analysisRunId: UUID
+
+
+class AnalysisRunOut(BaseModel):
+    analysisRunId: UUID
+    runSessionId: UUID
+    computeLocation: str
+    comparisonGroupId: Optional[UUID] = None
+    status: str
+    schemaVersion: str
+    engineVersion: str
+    resultSummary: Optional[dict] = None
+    createdAt: datetime
+    completedAt: Optional[datetime] = None

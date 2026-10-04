@@ -28,6 +28,34 @@ from utils.report_generator import generate_pdf_report
 router = APIRouter()
 
 
+def _compute_locations(run: RunSession) -> list[str]:
+    locations = sorted({analysis_run.compute_location for analysis_run in run.analysis_runs})
+    if locations:
+        return locations
+    return ["server"] if run.analysis is not None else []
+
+
+def _unanalyzed_session_out(run: RunSession) -> UnanalyzedRunSessionInfoOut:
+    uploaded = {video.camera_index for video in run.videos}
+    missing = [index for index in range(run.camera_count) if index not in uploaded]
+    video_paths: list[str | None] = [None] * run.camera_count
+    for video in run.videos:
+        if 0 <= video.camera_index < run.camera_count:
+            video_paths[video.camera_index] = video.video_path
+
+    return UnanalyzedRunSessionInfoOut(
+        runSessionId=run.id,
+        runnerId=run.runner_id,
+        runnerName=run.runner.name,
+        date=run.date,
+        cameraCount=run.camera_count,
+        fps=run.fps,
+        note=run.note,
+        unuploadedCameraIndexes=missing,
+        videoPaths=video_paths,
+    )
+
+
 @router.get("/runner", response_model=list[RunnerInfoOut])
 async def get_runners(
     session: AsyncSession = Depends(get_session),
@@ -94,6 +122,7 @@ async def get_runner_run_sessions(
         .options(
             selectinload(RunSession.runner),
             selectinload(RunSession.analysis),
+            selectinload(RunSession.analysis_runs),
         )
     )).scalars().all()
 
@@ -115,6 +144,7 @@ async def get_runner_run_sessions(
                 status=run.status,
                 progress=run.progress,
                 isLongJump=run.is_long_jump,
+                computeLocations=_compute_locations(run),
             )
         )
     return result
@@ -178,6 +208,7 @@ async def get_run_session_info(
         .options(
             selectinload(RunSession.runner),
             selectinload(RunSession.analysis),
+            selectinload(RunSession.analysis_runs),
         )
     )).scalars().first()
     if not run_session or run_session.runner.user_id != current_user.id:
@@ -195,6 +226,7 @@ async def get_run_session_info(
             status=run_session.status,
             progress=run_session.progress,
             isLongJump=run_session.is_long_jump,
+            computeLocations=_compute_locations(run_session),
         )
 
     analysis = run_session.analysis
@@ -209,6 +241,7 @@ async def get_run_session_info(
         status=run_session.status,
         progress=run_session.progress,
         isLongJump=run_session.is_long_jump,
+        computeLocations=_compute_locations(run_session),
         totalTime=round(analysis.total_time, 3) if analysis.total_time is not None else None,
         avgVelocity=round(analysis.avg_velocity, 3) if analysis.avg_velocity is not None else None,
         avgAcceleration=round(analysis.avg_acceleration, 3) if analysis.avg_acceleration is not None else None,

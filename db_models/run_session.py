@@ -41,3 +41,4 @@ class RunSession(SQLModel, table=True):
 
     videos: List["Video"] = Relationship(back_populates="run_session")
     analysis: Optional["AnalysisMeta"] = Relationship(back_populates="run_session")
+    analysis_runs: List["AnalysisRun"] = Relationship(back_populates="run_session")
