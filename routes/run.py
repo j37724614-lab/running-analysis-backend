@@ -951,6 +951,12 @@ async def get_run_session_video(
         video_path = uncropped_matches[0] if uncropped_matches else None
 
     if video_path is None:
+        # The on-device pipeline currently emits metrics/pose artifacts but no
+        # rendered overlay, so Local sessions play their first source camera.
+        camera_matches = sorted(path for path in session_dir.glob("cam1.*") if path.is_file())
+        video_path = camera_matches[0] if camera_matches else None
+
+    if video_path is None:
         raise HTTPException(status_code=404, detail="Analysis video not found")
 
     return FileResponse(video_path)

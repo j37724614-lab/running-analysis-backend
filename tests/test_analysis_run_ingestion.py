@@ -19,7 +19,7 @@ from routes.analysis_run import (
     ingest_analysis_run_manifest,
     submit_comparison_report,
 )
-from routes.run import get_run_session_info
+from routes.run import get_run_session_info, get_run_session_video
 
 JOINT_ORDER = [
     "nose", "left_eye", "right_eye", "left_ear", "right_ear", "left_shoulder",
@@ -134,6 +134,56 @@ def test_create_local_analysis_run_then_ingest_manifest_marks_completed(tmp_path
 
             manifest_on_disk = tmp_path / str(created.runSessionId) / "local" / "manifest.json"
             assert manifest_on_disk.exists()
+
+        await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_local_ingestion_stores_source_video_for_run_session_playback(tmp_path, monkeypatch):
+    import routes.analysis_run as analysis_run_module
+    import routes.run as run_module
+
+    monkeypatch.setattr(analysis_run_module, "RUN_SESSION_DIR", tmp_path)
+    monkeypatch.setattr(run_module, "RUN_SESSION_DIR", tmp_path)
+
+    async def scenario():
+        engine = await _make_engine()
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with session_factory() as session:
+            user, runner = await _setup_runner_and_user(session)
+            created = await create_local_analysis_run(
+                CreateLocalAnalysisRunIn(runnerId=runner.id, cameraCount=1, fps=60),
+                session=session,
+                current_user=user,
+            )
+            manifest_doc = _valid_manifest()
+            manifest_doc["input_videos"][0]["sha256"] = hashlib.sha256(b"local-video").hexdigest()
+            manifest_file = UploadFile(
+                file=BytesIO(json.dumps(manifest_doc).encode()),
+                filename="manifest.json",
+            )
+            source_video = UploadFile(file=BytesIO(b"local-video"), filename="IMG_0085.MOV")
+
+            await ingest_analysis_run_manifest(
+                created.analysisRunId,
+                manifest=manifest_file,
+                artifacts=[],
+                input_videos=[source_video],
+                idempotency_key="video-1",
+                session=session,
+                current_user=user,
+            )
+
+            expected = tmp_path / str(runner.id) / str(created.runSessionId) / "cam1.MOV"
+            assert expected.read_bytes() == b"local-video"
+
+            response = await get_run_session_video(
+                created.runSessionId,
+                session=session,
+                current_user=user,
+            )
+            assert response.path == expected
 
         await engine.dispose()
 

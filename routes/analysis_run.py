@@ -5,8 +5,10 @@ Deliberately does NOT call into `runner-analysis-pipeline` — ingestion only
 accepts an already-computed result and stores it, so a Local result can never
 get silently recomputed/overwritten by the Server pipeline (§7).
 """
+import hashlib
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import List, Optional
 from uuid import UUID, uuid4
 
@@ -136,6 +138,7 @@ async def ingest_analysis_run_manifest(
     analysis_run_id: UUID,
     manifest: UploadFile = File(...),
     artifacts: List[UploadFile] = File(default=[]),
+    input_videos: Optional[List[UploadFile]] = File(default=None),
     idempotency_key: Optional[str] = Form(default=None),
     session: AsyncSession = Depends(get_session),
     current_user: User = Depends(get_current_user),
@@ -186,6 +189,18 @@ async def ingest_analysis_run_manifest(
             ),
         )
 
+    # Direct unit calls see FastAPI's File() marker when this optional argument
+    # is omitted; HTTP requests supply an actual list.
+    uploaded_videos = input_videos if isinstance(input_videos, list) else []
+    if uploaded_videos and len(uploaded_videos) != run_session.camera_count:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"received {len(uploaded_videos)} input videos but this session expects "
+                f"{run_session.camera_count} (camera_count)"
+            ),
+        )
+
     artifacts_by_relative_path = {}
     for upload in artifacts:
         data = await upload.read()
@@ -227,6 +242,31 @@ async def ingest_analysis_run_manifest(
         artifact_path = result_dir / relative_path
         artifact_path.parent.mkdir(parents=True, exist_ok=True)
         artifact_path.write_bytes(artifacts_by_relative_path[relative_path])
+
+    # Server uploads already use this canonical directory. Keeping Local input
+    # videos in the same layout lets the playback endpoint serve them too.
+    video_dir = RUN_SESSION_DIR / str(run_session.runner_id) / str(run_session.id)
+    video_dir.mkdir(parents=True, exist_ok=True)
+    for index, (upload, declared) in enumerate(
+        zip(uploaded_videos, manifest_doc["input_videos"]), start=1
+    ):
+        suffix = Path(upload.filename or "").suffix
+        if not suffix or len(suffix) > 10 or not suffix[1:].isalnum():
+            suffix = ".mp4"
+        destination = video_dir / f"cam{index}{suffix}"
+        partial = destination.with_suffix(f"{destination.suffix}.part")
+        digest = hashlib.sha256()
+        with partial.open("wb") as output:
+            while chunk := await upload.read(1024 * 1024):
+                digest.update(chunk)
+                output.write(chunk)
+        if digest.hexdigest() != declared["sha256"]:
+            partial.unlink(missing_ok=True)
+            raise HTTPException(
+                status_code=422,
+                detail=f"input video {index} content does not match the manifest sha256",
+            )
+        partial.replace(destination)
 
     manifest_status = manifest_doc["status"]
     run.status = manifest_status if manifest_status in ("completed", "degraded") else "failed"
