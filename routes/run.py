@@ -934,6 +934,17 @@ async def get_run_session_video(
         if summary_video and Path(summary_video).exists():
             video_path = Path(summary_video)
 
+    # Local result bundles declare the rendered HRNet video as an overlay
+    # artifact. Prefer it over the raw camera fallback when present.
+    if video_path is None and run_session.result_dir:
+        result_dir = Path(run_session.result_dir)
+        video_path = _first_existing(
+            [
+                result_dir / "overlay" / "main.mp4",
+                result_dir / "main_overlay.mp4",
+            ]
+        )
+
     session_dir = RUN_SESSION_DIR / str(run_session.runner_id) / str(run_session_id)
     if video_path is None:
         video_path = _first_existing(

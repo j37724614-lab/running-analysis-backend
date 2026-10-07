@@ -157,18 +157,29 @@ def test_local_ingestion_stores_source_video_for_run_session_playback(tmp_path, 
                 session=session,
                 current_user=user,
             )
-            manifest_doc = _valid_manifest()
+            overlay_bytes = b"hrnet-overlay-video"
+            overlay_artifact = {
+                "artifact_id": str(uuid4()),
+                "type": "overlay",
+                "media_type": "video/mp4",
+                "relative_path": "overlay/main.mp4",
+                "sha256": hashlib.sha256(overlay_bytes).hexdigest(),
+                "size_bytes": len(overlay_bytes),
+                "camera_index": 0,
+            }
+            manifest_doc = _valid_manifest(artifacts=[overlay_artifact])
             manifest_doc["input_videos"][0]["sha256"] = hashlib.sha256(b"local-video").hexdigest()
             manifest_file = UploadFile(
                 file=BytesIO(json.dumps(manifest_doc).encode()),
                 filename="manifest.json",
             )
             source_video = UploadFile(file=BytesIO(b"local-video"), filename="IMG_0085.MOV")
+            overlay_video = UploadFile(file=BytesIO(overlay_bytes), filename="overlay/main.mp4")
 
             await ingest_analysis_run_manifest(
                 created.analysisRunId,
                 manifest=manifest_file,
-                artifacts=[],
+                artifacts=[overlay_video],
                 input_videos=[source_video],
                 idempotency_key="video-1",
                 session=session,
@@ -183,7 +194,8 @@ def test_local_ingestion_stores_source_video_for_run_session_playback(tmp_path, 
                 session=session,
                 current_user=user,
             )
-            assert response.path == expected
+            expected_overlay = tmp_path / str(created.runSessionId) / "local" / "overlay/main.mp4"
+            assert response.path == expected_overlay
 
         await engine.dispose()
 
