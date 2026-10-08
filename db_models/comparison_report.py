@@ -1,12 +1,10 @@
 # models/comparison_report.py
 """Storage for a validated contract v1 `ComparisonReport` (規劃書 Step 10).
 
-Computing the actual metric/performance differences is out of scope here —
-that needs real Local 2D/3D output to diff against Server output, which
-depends on work (Steps 6-8, 15-18) that isn't done yet. This model and the
-ingestion endpoint only provide schema-validated storage and lookup by
-`comparison_group_id`, so whichever side first has both runs' numbers can
-submit a report and either side can retrieve it afterward.
+The backend now creates the initial 2D report automatically once both sides
+of a Compare pair have completed. Later pipeline stages extend the same
+schema with 3D, speed and gait metrics; this table remains the stable storage
+and lookup point keyed by `comparison_group_id`.
 """
 from datetime import datetime
 from typing import Dict

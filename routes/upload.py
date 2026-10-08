@@ -10,14 +10,14 @@ from pathlib import Path
 from uuid import UUID
 
 import cv2
-import pandas as pd
 from fastapi import APIRouter, UploadFile, File, Depends, HTTPException
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.session import get_session, async_session
-from db_models import RunSession, AnalysisMeta, Video, User, Runner
+from db_models import AnalysisRun, RunSession, AnalysisMeta, Video, User, Runner
 from routes.auth import get_current_user
+from routes.analysis_run import generate_and_store_comparison_report
 from config import ENABLE_MOCK_ON_FAILURE, PIPELINE_ROOT, RUN_SESSION_DIR, TEMP_UPLOAD_DIR
 from response_chemas import (
     UploadSeperatelyStatus,
@@ -29,10 +29,46 @@ from response_chemas import (
 pipeline_dir = str(PIPELINE_ROOT)
 if pipeline_dir not in sys.path:
     sys.path.insert(0, pipeline_dir)
-from core.pipeline import run_analysis, AnalysisOptions, PoseScope, TrackedVideoSource
+from core.pipeline import run_analysis_with_manifest, AnalysisOptions, PoseScope, TrackedVideoSource
 
 
 router = APIRouter()
+
+
+def long_jump_pipeline_config(is_long_jump: bool) -> dict:
+    """Return the running long-jump pipeline settings for an uploaded session."""
+    if not is_long_jump:
+        return {}
+
+    config = {
+        # The previous probabilistic ground-model detector remains selectable
+        # by changing this algorithm name; no duplicate touchdown pass runs.
+        "long_jump_final_landing": True,
+        "running_long_jump": {
+            "enabled": True,
+            "algorithm": "event_pair_bilateral_valley",
+            "foot_confidence_min": 0.50,
+            "ankle_confidence_min": 0.50,
+            "bilateral_valley_min_rise_px": 8.0,
+            # Retained for the X-boundary diagnostic plot and legacy rollback.
+            "anchor_polygon_margin_px": 10.0,
+        },
+        # Only approach run_step contacts can adopt an observed low-score heel;
+        # final_landing and the original touchdown frames remain unchanged.
+        "touchdown_heel_residual": {
+            "mode": "apply",
+            "min_heel_confidence": 0.35,
+            "min_donors": 5,
+        },
+    }
+    # Long-jump analyses use the tracked-frame handoff by default.  Keep the
+    # MP4 route as an explicit rollback while downstream events are verified.
+    pose_handoff = os.environ.get("RUNNING_ANALYSIS_POSE_HANDOFF", "bounded_stream")
+    if pose_handoff == "bounded_stream":
+        config["pose_handoff"] = "bounded_stream"
+    elif pose_handoff != "video":
+        raise ValueError(f"Unsupported RUNNING_ANALYSIS_POSE_HANDOFF: {pose_handoff}")
+    return config
 
 
 def analysis_result_fields(raw_data: dict | None) -> dict:
@@ -209,6 +245,13 @@ async def analyze_and_save(runner_id: str, run_session_id: str, camera_count: in
 
             run_session.status = "processing"
             run_session.progress = 0
+            server_run = (
+                await session.execute(
+                    select(AnalysisRun)
+                    .where(AnalysisRun.run_session_id == UUID(run_session_id))
+                    .where(AnalysisRun.compute_location == "server")
+                )
+            ).scalars().first()
             await session.commit()
 
             loop = asyncio.get_running_loop()
@@ -231,9 +274,10 @@ async def analyze_and_save(runner_id: str, run_session_id: str, camera_count: in
                 "tracking_mode": "two_pass",
                 "prescan_enabled": True,
                 "prescan_engine_path": "/home/jeter/runner-analysis-pipeline/models/yolo26x_ultralytics_int8.engine",
+                "prescan_stride": 15,
+                "prescan_buffer_sec": 0.5,
             }
-            if run_session.is_long_jump:
-                config_dict["long_jump_final_landing"] = True
+            config_dict.update(long_jump_pipeline_config(run_session.is_long_jump))
             videos_sorted = sorted(videos, key=lambda x: x.camera_index)
             meta_data_cameras = []
 
@@ -280,7 +324,7 @@ async def analyze_and_save(runner_id: str, run_session_id: str, camera_count: in
             # AnalysisOptions object instead of individual gpu/only_2d/
             # skip_track/output_dest/progress_callback keyword args.
             raw_data = await asyncio.to_thread(
-                run_analysis,
+                run_analysis_with_manifest,
                 config_dict,
                 AnalysisOptions(
                     gpu="0",
@@ -288,6 +332,10 @@ async def analyze_and_save(runner_id: str, run_session_id: str, camera_count: in
                     tracked_video_source=TrackedVideoSource.GENERATE,
                     output_dest=folder,
                     progress_callback=progress_callback,
+                ),
+                engine_version="backend-integrated",
+                comparison_group_id=(
+                    server_run.comparison_group_id if server_run is not None else None
                 ),
             )
 
@@ -310,8 +358,23 @@ async def analyze_and_save(runner_id: str, run_session_id: str, camera_count: in
             run_session = await session.get(RunSession, UUID(run_session_id))
             run_session.status = "done"
             run_session.progress = 100
+            if server_run:
+                server_run.status = "completed"
+                server_run.engine_version = "backend-integrated"
+                server_run.result_summary = {
+                    "total_time_seconds": result_fields["total_time"],
+                    "average_speed_mps": result_fields["avg_velocity"],
+                    "average_acceleration_mps2": result_fields["avg_acceleration"],
+                    "average_step_length_m": result_fields["avg_step_length"],
+                }
+                server_run.completed_at = datetime.utcnow()
 
             await session.commit()
+            if server_run and server_run.comparison_group_id is not None:
+                await generate_and_store_comparison_report(
+                    server_run.comparison_group_id,
+                    session,
+                )
         except Exception as e:
             print(f"Error during analysis for session {run_session_id}: {e}")
             await session.rollback()
@@ -342,6 +405,16 @@ async def analyze_and_save(runner_id: str, run_session_id: str, camera_count: in
                     run_session = await session.get(RunSession, UUID(run_session_id))
                     if run_session:
                         run_session.status = "failed"
+                        server_run = (
+                            await session.execute(
+                                select(AnalysisRun)
+                                .where(AnalysisRun.run_session_id == UUID(run_session_id))
+                                .where(AnalysisRun.compute_location == "server")
+                            )
+                        ).scalars().first()
+                        if server_run:
+                            server_run.status = "failed"
+                            server_run.completed_at = datetime.utcnow()
                         await session.commit()
                         print(f"Set session {run_session_id} status to failed")
                 except Exception as inner_e:
@@ -405,6 +478,17 @@ async def upload_all_info(
 
     await session.commit()
     await session.refresh(runSession)
+
+    if req.comparisonGroupId is not None:
+        session.add(
+            AnalysisRun(
+                run_session_id=runSession.id,
+                compute_location="server",
+                comparison_group_id=req.comparisonGroupId,
+                status="processing",
+            )
+        )
+        await session.commit()
 
     for cameraIndex, info in enumerate(req.videos):
         tempVideoId = info.tempVideoId
@@ -517,12 +601,32 @@ async def upload_seperately_select(
     session: AsyncSession = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> UploadSeperatelyStatus:
-    # Verify runner belongs to current user
-    runner = (await session.execute(
-        select(Runner).where(Runner.id == UUID(req.runnerId)).where(Runner.user_id == current_user.id)
-    )).scalars().first()
-    if not runner:
-        raise HTTPException(status_code=404, detail="Runner not found or unauthorized")
+    # A pending session may be completed by another authenticated user through
+    # a shared runSessionId. Validate the session/runner/camera relationship
+    # before moving the uploaded file.
+    runSession = await session.get(RunSession, UUID(req.runSessionId))
+    if not runSession:
+        raise HTTPException(status_code=404, detail="RunSession not found")
+    if runSession.status != "pending":
+        raise HTTPException(status_code=409, detail="RunSession is not pending")
+    if runSession.runner_id != UUID(req.runnerId):
+        raise HTTPException(
+            status_code=400,
+            detail="Runner ID mismatch for RunSession",
+        )
+    if not 0 <= req.cameraIndex < runSession.camera_count:
+        raise HTTPException(status_code=400, detail="Camera index out of range")
+
+    existing_video = (
+        await session.execute(
+            select(Video).where(
+                Video.run_session_id == runSession.id,
+                Video.camera_index == req.cameraIndex,
+            )
+        )
+    ).scalars().first()
+    if existing_video:
+        raise HTTPException(status_code=409, detail="Camera video already uploaded")
 
     stored_path = move_temp_video_and_del_thumbnail(
         req.tempVideoId,
@@ -550,8 +654,6 @@ async def upload_seperately_select(
     session.add(video)
     await session.commit()
     await session.refresh(video)
-
-    runSession = await session.get(RunSession, UUID(req.runSessionId))
 
     stmt = select(Video.camera_index).where(
         Video.run_session_id == UUID(req.runSessionId)

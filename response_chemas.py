@@ -31,6 +31,7 @@ class RunSessionInfoOut(BaseModel):
     progress: int = 0
     isLongJump: bool = False
     computeLocations: List[str] = Field(default_factory=list)
+    comparisonGroupId: Optional[UUID] = None
 
 
 class UnanalyzedRunSessionInfoOut(BaseModel):
@@ -105,6 +106,7 @@ class UploadAllRequest(BaseModel):
     note: str
     videos: list[UploadVideoInfoIn]
     isLongJump: bool = False
+    comparisonGroupId: Optional[UUID] = None
 
 
 class UploadSeperatelyStatus(BaseModel):
@@ -151,6 +153,11 @@ class StepsOut(BaseModel):
     avgStepLengthM: Optional[float] = None
     avgCadenceSpm: Optional[float] = None
     steps: list[StepSampleOut]
+    # The operator's own runway-width measurement from 6-point calibration
+    # (AnchorResult.runwayWidthM on the frontend), keyed by camera index --
+    # not derived from where feet happened to land, which is only ever an
+    # approximation of the calibrated lane width.
+    runwayWidthByCam: Optional[dict[int, float]] = None
 
 
 class ToePointOut(BaseModel):
@@ -184,6 +191,7 @@ class CreateLocalAnalysisRunIn(BaseModel):
     isLongJump: bool = False
     note: str = ""
     comparisonGroupId: Optional[UUID] = None
+    runSessionId: Optional[UUID] = None
 
 
 class CreateLocalAnalysisRunOut(BaseModel):

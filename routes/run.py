@@ -35,6 +35,15 @@ def _compute_locations(run: RunSession) -> list[str]:
     return ["server"] if run.analysis is not None else []
 
 
+def _comparison_group_id(run: RunSession):
+    groups = {
+        analysis_run.comparison_group_id
+        for analysis_run in run.analysis_runs
+        if analysis_run.comparison_group_id is not None
+    }
+    return next(iter(groups)) if len(groups) == 1 else None
+
+
 def _unanalyzed_session_out(run: RunSession) -> UnanalyzedRunSessionInfoOut:
     uploaded = {video.camera_index for video in run.videos}
     missing = [index for index in range(run.camera_count) if index not in uploaded]
@@ -145,6 +154,7 @@ async def get_runner_run_sessions(
                 progress=run.progress,
                 isLongJump=run.is_long_jump,
                 computeLocations=_compute_locations(run),
+                comparisonGroupId=_comparison_group_id(run),
             )
         )
     return result
@@ -169,31 +179,43 @@ async def get_unanalyzed_run_sessions(
         select(RunSession)
         .where(RunSession.runner_id == runner_id)
         .where(RunSession.status == "pending")
+        .order_by(RunSession.date.desc())
         .options(
             selectinload(RunSession.runner),
             selectinload(RunSession.videos),
         )
     )).scalars().all()
 
-    result = []
-    for run in runs:
-        uploaded = {v.camera_index for v in run.videos}
-        missing = [i for i in range(run.camera_count) if i not in uploaded]
+    return [_unanalyzed_session_out(run) for run in runs]
 
-        result.append(
-            UnanalyzedRunSessionInfoOut(
-                runSessionId=run.id,
-                runnerId=runner_id,
-                runnerName=run.runner.name,
-                date=run.date,
-                cameraCount=run.camera_count,
-                fps=run.fps,
-                note=run.note,
-                unuploadedCameraIndexes=missing,
-                videoPaths=[v.video_path if v else None for v in run.videos],
+
+@router.get(
+    "/run_session/{run_session_id}/unanalyzed",
+    response_model=UnanalyzedRunSessionInfoOut,
+)
+async def get_unanalyzed_run_session_by_id(
+    run_session_id: UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> UnanalyzedRunSessionInfoOut:
+    """Load a pending session shared by its unguessable session identifier."""
+    run = (
+        await session.execute(
+            select(RunSession)
+            .where(RunSession.id == run_session_id)
+            .where(RunSession.status == "pending")
+            .options(
+                selectinload(RunSession.runner),
+                selectinload(RunSession.videos),
             )
         )
-    return result
+    ).scalars().first()
+    if not run:
+        raise HTTPException(
+            status_code=404,
+            detail="Unanalyzed run session not found or already analyzed",
+        )
+    return _unanalyzed_session_out(run)
 
 
 @router.get("/run_session/{run_session_id}")
@@ -227,6 +249,7 @@ async def get_run_session_info(
             progress=run_session.progress,
             isLongJump=run_session.is_long_jump,
             computeLocations=_compute_locations(run_session),
+            comparisonGroupId=_comparison_group_id(run_session),
         )
 
     analysis = run_session.analysis
@@ -242,6 +265,7 @@ async def get_run_session_info(
         progress=run_session.progress,
         isLongJump=run_session.is_long_jump,
         computeLocations=_compute_locations(run_session),
+        comparisonGroupId=_comparison_group_id(run_session),
         totalTime=round(analysis.total_time, 3) if analysis.total_time is not None else None,
         avgVelocity=round(analysis.avg_velocity, 3) if analysis.avg_velocity is not None else None,
         avgAcceleration=round(analysis.avg_acceleration, 3) if analysis.avg_acceleration is not None else None,
@@ -322,7 +346,7 @@ async def delete_runner(
     current_user: User = Depends(get_current_user)
 ):
     import shutil
-    from db_models import RunSession, AnalysisMeta, Video
+    from db_models import RunSession, AnalysisMeta
 
     # 1. Fetch runner
     runner = (await session.execute(

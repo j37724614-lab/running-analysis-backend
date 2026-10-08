@@ -39,8 +39,77 @@ from utils.contract_v1 import (
     validate_comparison_report,
     validate_manifest,
 )
+from utils.comparison_v1 import build_2d_comparison_report
 
 router = APIRouter()
+
+
+async def generate_and_store_comparison_report(
+    comparison_group_id: UUID,
+    session: AsyncSession,
+) -> Optional[dict]:
+    """Generate once both sides of a Compare group have usable manifests."""
+    runs = (
+        await session.execute(
+            select(AnalysisRun).where(
+                AnalysisRun.comparison_group_id == comparison_group_id
+            )
+        )
+    ).scalars().all()
+    server_run = next((run for run in runs if run.compute_location == "server"), None)
+    local_run = next((run for run in runs if run.compute_location == "local"), None)
+    usable = {"completed", "degraded"}
+    if not server_run or not local_run:
+        return None
+    if server_run.status not in usable or local_run.status not in usable:
+        return None
+    if server_run.run_session_id != local_run.run_session_id:
+        return None
+
+    run_session = await session.get(RunSession, server_run.run_session_id)
+    if run_session is None:
+        return None
+    server_root = RUN_SESSION_DIR / str(run_session.runner_id) / str(run_session.id)
+    local_root = RUN_SESSION_DIR / str(run_session.id) / "local"
+    server_manifest_path = server_root / "manifest.json"
+    local_manifest_path = local_root / "manifest.json"
+    if not server_manifest_path.is_file() or not local_manifest_path.is_file():
+        return None
+
+    report = build_2d_comparison_report(
+        comparison_group_id=comparison_group_id,
+        server_run_id=server_run.id,
+        local_run_id=local_run.id,
+        server_manifest=json.loads(server_manifest_path.read_text(encoding="utf-8")),
+        local_manifest=json.loads(local_manifest_path.read_text(encoding="utf-8")),
+        server_root=server_root,
+        local_root=local_root,
+    )
+    validate_comparison_report(report)
+    existing = (
+        await session.execute(
+            select(ComparisonReport).where(
+                ComparisonReport.comparison_group_id == comparison_group_id
+            )
+        )
+    ).scalars().first()
+    if existing:
+        existing.status = report["status"]
+        existing.input_hashes_match = report["input_hashes_match"]
+        existing.payload = report
+    else:
+        session.add(
+            ComparisonReport(
+                comparison_group_id=comparison_group_id,
+                server_run_id=server_run.id,
+                local_run_id=local_run.id,
+                status=report["status"],
+                input_hashes_match=report["input_hashes_match"],
+                payload=report,
+            )
+        )
+    await session.commit()
+    return report
 
 
 def _analysis_run_out(run: AnalysisRun) -> AnalysisRunOut:
@@ -97,17 +166,65 @@ async def create_local_analysis_run(
     if not runner:
         raise HTTPException(status_code=404, detail="Runner not found or unauthorized")
 
-    run_session = RunSession(
-        runner_id=runner.id,
-        date=req.date or datetime.now(timezone.utc),
-        camera_count=req.cameraCount,
-        fps=req.fps,
-        is_long_jump=req.isLongJump,
-        note=req.note,
-        status="processing",
-    )
-    session.add(run_session)
-    await session.flush()
+    run_session = None
+    if req.runSessionId is not None:
+        run_session = (
+            await session.execute(
+                select(RunSession)
+                .where(RunSession.id == req.runSessionId)
+                .where(RunSession.runner_id == runner.id)
+            )
+        ).scalars().first()
+    elif req.comparisonGroupId is not None:
+        server_run = (
+            await session.execute(
+                select(AnalysisRun)
+                .where(AnalysisRun.comparison_group_id == req.comparisonGroupId)
+                .where(AnalysisRun.compute_location == "server")
+            )
+        ).scalars().first()
+        if server_run is not None:
+            run_session = (
+                await session.execute(
+                    select(RunSession)
+                    .where(RunSession.id == server_run.run_session_id)
+                    .where(RunSession.runner_id == runner.id)
+                )
+            ).scalars().first()
+
+    if (req.runSessionId is not None or req.comparisonGroupId is not None) and run_session is None:
+        raise HTTPException(
+            status_code=409,
+            detail="The Server side of this Compare run has not created its RunSession yet",
+        )
+
+    if run_session is None:
+        run_session = RunSession(
+            runner_id=runner.id,
+            date=req.date or datetime.now(timezone.utc),
+            camera_count=req.cameraCount,
+            fps=req.fps,
+            is_long_jump=req.isLongJump,
+            note=req.note,
+            status="processing",
+        )
+        session.add(run_session)
+        await session.flush()
+
+    if req.comparisonGroupId is not None:
+        existing = (
+            await session.execute(
+                select(AnalysisRun)
+                .where(AnalysisRun.comparison_group_id == req.comparisonGroupId)
+                .where(AnalysisRun.compute_location == "local")
+                .where(AnalysisRun.run_session_id == run_session.id)
+            )
+        ).scalars().first()
+        if existing is not None:
+            return CreateLocalAnalysisRunOut(
+                runSessionId=existing.run_session_id,
+                analysisRunId=existing.id,
+            )
 
     analysis_run = AnalysisRun(
         run_session_id=run_session.id,
@@ -311,6 +428,8 @@ async def ingest_analysis_run_manifest(
 
     await session.commit()
     await session.refresh(run)
+    if run.comparison_group_id is not None:
+        await generate_and_store_comparison_report(run.comparison_group_id, session)
     return _analysis_run_out(run)
 
 

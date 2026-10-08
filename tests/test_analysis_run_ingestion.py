@@ -140,6 +140,59 @@ def test_create_local_analysis_run_then_ingest_manifest_marks_completed(tmp_path
     asyncio.run(scenario())
 
 
+def test_compare_local_run_reuses_server_run_session():
+    async def scenario():
+        engine = await _make_engine()
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with session_factory() as session:
+            user, runner = await _setup_runner_and_user(session)
+            group_id = uuid4()
+            run_session = RunSession(
+                runner_id=runner.id,
+                date=datetime.now(timezone.utc),
+                camera_count=1,
+                fps=60,
+                note="compare",
+                status="processing",
+            )
+            session.add(run_session)
+            await session.flush()
+            server_run = AnalysisRun(
+                run_session_id=run_session.id,
+                compute_location="server",
+                comparison_group_id=group_id,
+                status="processing",
+            )
+            session.add(server_run)
+            await session.commit()
+
+            created = await create_local_analysis_run(
+                CreateLocalAnalysisRunIn(
+                    runnerId=runner.id,
+                    cameraCount=1,
+                    fps=60,
+                    comparisonGroupId=group_id,
+                ),
+                session=session,
+                current_user=user,
+            )
+
+            assert created.runSessionId == run_session.id
+            runs = (
+                await session.execute(
+                    select(AnalysisRun).where(
+                        AnalysisRun.run_session_id == run_session.id
+                    )
+                )
+            ).scalars().all()
+            assert {run.compute_location for run in runs} == {"server", "local"}
+            assert {run.comparison_group_id for run in runs} == {group_id}
+
+        await engine.dispose()
+
+    asyncio.run(scenario())
+
+
 def test_local_ingestion_stores_source_video_for_run_session_playback(tmp_path, monkeypatch):
     import routes.analysis_run as analysis_run_module
     import routes.run as run_module
