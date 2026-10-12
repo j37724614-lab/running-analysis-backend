@@ -5,7 +5,9 @@ Deliberately does NOT call into `runner-analysis-pipeline` — ingestion only
 accepts an already-computed result and stores it, so a Local result can never
 get silently recomputed/overwritten by the Server pipeline (§7).
 """
+import csv
 import hashlib
+import io
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,6 +44,63 @@ from utils.contract_v1 import (
 from utils.comparison_v1 import build_2d_comparison_report
 
 router = APIRouter()
+
+
+def _local_angles_csv_bytes(
+    manifest_doc: dict,
+    artifacts_by_relative_path: dict[str, bytes],
+) -> bytes | None:
+    """Convert canonical Local angles JSON into the legacy CSV view.
+
+    JSON remains the hashed source artifact. The CSV is a derived backend
+    compatibility view so existing graph/report endpoints can consume Local
+    results without teaching every endpoint about both serializations.
+    """
+    declared = next(
+        (
+            artifact
+            for artifact in manifest_doc.get("artifacts", [])
+            if artifact.get("type") == "angles"
+            and artifact.get("media_type") == "application/json"
+        ),
+        None,
+    )
+    if declared is None:
+        return None
+    relative_path = declared["relative_path"]
+    try:
+        document = json.loads(artifacts_by_relative_path[relative_path])
+        frames = document["frames"]
+        if not isinstance(frames, list):
+            raise TypeError("frames must be an array")
+        keys = sorted({
+            key
+            for frame in frames
+            for key in frame.get("values_degrees", {}).keys()
+        })
+        output = io.StringIO(newline="")
+        writer = csv.DictWriter(
+            output,
+            fieldnames=["frame", "time_sec", "time_s", *keys],
+        )
+        writer.writeheader()
+        for absolute_frame, frame in enumerate(frames):
+            values = frame.get("values_degrees")
+            if not isinstance(values, dict):
+                raise TypeError("values_degrees must be an object")
+            timestamp = float(frame["timestamp_seconds"])
+            writer.writerow({
+                "frame": absolute_frame,
+                "time_sec": timestamp,
+                "time_s": timestamp,
+                **{key: values.get(key) for key in keys},
+            })
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise HTTPException(
+            status_code=422,
+            detail=f"angles JSON cannot be converted for result APIs: {error}",
+        ) from error
+    return output.getvalue().encode("utf-8")
 
 
 async def generate_and_store_comparison_report(
@@ -351,6 +410,11 @@ async def ingest_analysis_run_manifest(
                 detail=f"artifact {relative_path!r} size does not match the manifest",
             )
 
+    derived_angles_csv = _local_angles_csv_bytes(
+        manifest_doc,
+        artifacts_by_relative_path,
+    )
+
     result_dir = RUN_SESSION_DIR / str(run_session.id) / run.compute_location
     result_dir.mkdir(parents=True, exist_ok=True)
     (result_dir / "manifest.json").write_bytes(manifest_bytes)
@@ -359,6 +423,8 @@ async def ingest_analysis_run_manifest(
         artifact_path = result_dir / relative_path
         artifact_path.parent.mkdir(parents=True, exist_ok=True)
         artifact_path.write_bytes(artifacts_by_relative_path[relative_path])
+    if derived_angles_csv is not None:
+        (result_dir / "angles.csv").write_bytes(derived_angles_csv)
 
     # Server uploads already use this canonical directory. Keeping Local input
     # videos in the same layout lets the playback endpoint serve them too.

@@ -5,7 +5,7 @@ from html import escape
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
-from sqlalchemy import select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 import numpy as np
@@ -13,7 +13,7 @@ import pandas as pd
 
 from config import RUN_SESSION_DIR, TEMP_UPLOAD_DIR
 from db.session import get_session
-from db_models import Runner, RunSession, User
+from db_models import AnalysisRun, ComparisonReport, Runner, RunSession, User
 from routes.auth import get_current_user
 from response_chemas import (
     AddRunnerIn,
@@ -321,7 +321,25 @@ async def delete_run_session(
         except Exception:
             pass
 
-    # 3. Clean up database entries
+    # 3. Clean up database entries. AnalysisRun was added after this endpoint
+    # was first written and has a non-nullable FK to RunSession. Compare reports
+    # in turn reference both AnalysisRun rows, so dependency order matters:
+    # ComparisonReport -> AnalysisRun -> RunSession.
+    analysis_run_ids = select(AnalysisRun.id).where(
+        AnalysisRun.run_session_id == run_session_id
+    )
+    await session.execute(
+        delete(ComparisonReport).where(
+            or_(
+                ComparisonReport.server_run_id.in_(analysis_run_ids),
+                ComparisonReport.local_run_id.in_(analysis_run_ids),
+            )
+        )
+    )
+    await session.execute(
+        delete(AnalysisRun).where(AnalysisRun.run_session_id == run_session_id)
+    )
+
     # Delete related analysis_meta row
     analysis = (await session.execute(
         select(AnalysisMeta).where(AnalysisMeta.run_session_id == run_session_id)

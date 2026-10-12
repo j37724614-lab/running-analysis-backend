@@ -19,7 +19,7 @@ from routes.analysis_run import (
     ingest_analysis_run_manifest,
     submit_comparison_report,
 )
-from routes.run import get_run_session_info, get_run_session_video
+from routes.run import get_run_session_angles, get_run_session_info, get_run_session_video
 
 JOINT_ORDER = [
     "nose", "left_eye", "right_eye", "left_ear", "right_ear", "left_shoulder",
@@ -249,6 +249,72 @@ def test_local_ingestion_stores_source_video_for_run_session_playback(tmp_path, 
             )
             expected_overlay = tmp_path / str(created.runSessionId) / "local" / "overlay/main.mp4"
             assert response.path == expected_overlay
+
+        await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_local_angles_json_is_available_through_existing_result_api(tmp_path, monkeypatch):
+    import routes.analysis_run as analysis_run_module
+
+    monkeypatch.setattr(analysis_run_module, "RUN_SESSION_DIR", tmp_path)
+
+    async def scenario():
+        engine = await _make_engine()
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with session_factory() as session:
+            user, runner = await _setup_runner_and_user(session)
+            created = await create_local_analysis_run(
+                CreateLocalAnalysisRunIn(runnerId=runner.id, cameraCount=1, fps=60),
+                session=session,
+                current_user=user,
+            )
+            angles_doc = {
+                "schema_version": "1.0.0",
+                "frames": [
+                    {
+                        "camera_index": 0,
+                        "source_frame": 12,
+                        "timestamp_seconds": 0.2,
+                        "raw_values_degrees": {"left_knee_angle": 130.0},
+                        "values_degrees": {
+                            "left_knee_angle": 50.0,
+                            "right_knee_angle": 55.0,
+                        },
+                    }
+                ],
+            }
+            angles_bytes = json.dumps(angles_doc).encode()
+            artifact = {
+                "artifact_id": str(uuid4()),
+                "type": "angles",
+                "media_type": "application/json",
+                "relative_path": "angles.json",
+                "sha256": hashlib.sha256(angles_bytes).hexdigest(),
+                "size_bytes": len(angles_bytes),
+            }
+            manifest_doc = _valid_manifest(artifacts=[artifact], status="degraded")
+
+            await ingest_analysis_run_manifest(
+                created.analysisRunId,
+                manifest=UploadFile(
+                    file=BytesIO(json.dumps(manifest_doc).encode()),
+                    filename="manifest.json",
+                ),
+                artifacts=[UploadFile(file=BytesIO(angles_bytes), filename="angles.json")],
+                idempotency_key="angles-json-1",
+                session=session,
+                current_user=user,
+            )
+
+            derived_csv = tmp_path / str(created.runSessionId) / "local" / "angles.csv"
+            assert derived_csv.exists()
+            response = await get_run_session_angles(created.runSessionId, session=session)
+            assert response["columns"] == ["left_knee_angle", "right_knee_angle"]
+            assert response["samples"][0]["frame"] == 0
+            assert response["samples"][0]["timeSec"] == 0.2
+            assert response["samples"][0]["values"]["left_knee_angle"] == 50.0
 
         await engine.dispose()
 
