@@ -40,6 +40,10 @@ def test_builds_aligned_pose_and_bbox_report(tmp_path):
         orig_frames=np.asarray([7]),
         cam_indices=np.asarray([0]),
     )
+    server_pose3d_dir = server_root / "run" / "pred_3D"
+    server_pose3d_dir.mkdir(parents=True)
+    pose3d = np.asarray([[[float(i), float(i + 1), float(i + 2)] for i in range(17)]])
+    np.savez(server_pose3d_dir / "3Dkeypoints.npz", pred_3d=pose3d)
     with (server_root / "cam1_tracked_bbox_map.csv").open("w", newline="") as target:
         writer = csv.DictWriter(target, fieldnames=["cam", "source_frame", "x1", "y1", "x2", "y2"])
         writer.writeheader()
@@ -69,6 +73,52 @@ def test_builds_aligned_pose_and_bbox_report(tmp_path):
         }],
     }
     (server_pose_dir / "keypoints_2d.json").write_text(json.dumps(server_document))
+    local_pose3d = {
+        "schema_version": "1.0.0",
+        "joint_order": [f"joint_{index}" for index in range(17)],
+        "frames": [{
+            "camera_index": 0,
+            "source_frame": 7,
+            "timestamp_seconds": 0.1,
+            "joints": [
+                {"x": float(i) + 0.01, "y": float(i + 1), "z": float(i + 2)}
+                for i in range(17)
+            ],
+        }],
+    }
+    (local_pose_dir / "keypoints_3d.json").write_text(json.dumps(local_pose3d))
+    angle_fields = ["left_knee_angle", "right_knee_angle"]
+    with (server_root / "angles.csv").open("w", newline="") as target:
+        writer = csv.DictWriter(target, fieldnames=["frame", *angle_fields])
+        writer.writeheader()
+        writer.writerow({"frame": 0, "left_knee_angle": 90.0, "right_knee_angle": 100.0})
+    (local_root / "angles.json").write_text(json.dumps({
+        "schema_version": "1.0.0",
+        "frames": [{
+            "camera_index": 0,
+            "source_frame": 7,
+            "timestamp_seconds": 0.1,
+            "raw_values_degrees": {"left_knee_angle": 92.0, "right_knee_angle": 102.0},
+            "values_degrees": {"left_knee_angle": 92.0, "right_knee_angle": 102.0},
+        }],
+    }))
+    metric_fields = [
+        "cam", "source_frame", "dist_smooth_m", "speed_mps", "accel_mps2",
+    ]
+    for root, distance, speed, acceleration in (
+        (server_root, 1.20, 7.50, 2.10),
+        (local_root, 1.24, 7.55, 2.30),
+    ):
+        with (root / "metrics.csv").open("w", newline="") as target:
+            writer = csv.DictWriter(target, fieldnames=metric_fields)
+            writer.writeheader()
+            writer.writerow({
+                "cam": 1,
+                "source_frame": 7,
+                "dist_smooth_m": distance,
+                "speed_mps": speed,
+                "accel_mps2": acceleration,
+            })
 
     request_id = uuid4()
     report = build_2d_comparison_report(
@@ -91,10 +141,21 @@ def test_builds_aligned_pose_and_bbox_report(tmp_path):
         "wholebody23_mean_pixel_delta",
         "foot6_mean_pixel_delta",
         "bbox_mean_iou",
+        "distance_mean_absolute_error",
+        "speed_mean_absolute_error",
+        "acceleration_mean_absolute_error",
+        "pose3d_joint_mean_absolute_error",
+        "pose3d_joint_p95_absolute_error",
+        "angle_mean_absolute_error",
+        "angle_p95_absolute_error",
     } <= names
     metrics = {item["metric"]: item for item in report["metric_differences"]}
     assert metrics["wholebody23_mean_pixel_delta"]["absolute_difference"] == 0
     assert metrics["foot6_mean_pixel_delta"]["absolute_difference"] == 0
+    assert np.isclose(metrics["distance_mean_absolute_error"]["absolute_difference"], 0.04)
+    assert metrics["speed_mean_absolute_error"]["within_tolerance"] is True
+    assert np.isclose(metrics["pose3d_joint_mean_absolute_error"]["absolute_difference"], 0.01)
+    assert metrics["angle_mean_absolute_error"]["absolute_difference"] == 2.0
 
 
 def test_mismatched_inputs_are_not_compared(tmp_path):
