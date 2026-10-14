@@ -27,6 +27,7 @@ from db_models import (
     Runner,
     RunSession,
     User,
+    Video,
 )
 from response_chemas import (
     AnalysisRunOut,
@@ -38,6 +39,7 @@ from utils.contract_v1 import (
     ContractValidationError,
     is_safe_relative_path,
     sha256_bytes,
+    validate_artifact_document,
     validate_comparison_report,
     validate_manifest,
 )
@@ -99,6 +101,85 @@ def _local_angles_csv_bytes(
         raise HTTPException(
             status_code=422,
             detail=f"angles JSON cannot be converted for result APIs: {error}",
+        ) from error
+    return output.getvalue().encode("utf-8")
+
+
+def _local_metrics_csv_bytes(
+    manifest_doc: dict,
+    artifacts_by_relative_path: dict[str, bytes],
+) -> bytes | None:
+    """Convert canonical Local kinematics JSON into the existing metrics CSV.
+
+    The uploaded JSON remains the hashed source artifact. This derived view
+    lets the current graph/report endpoints render Local distance, velocity and
+    acceleration without maintaining a second plotting path.
+    """
+    declared = next(
+        (
+            artifact
+            for artifact in manifest_doc.get("artifacts", [])
+            if artifact.get("type") == "metrics"
+            and artifact.get("media_type") == "application/json"
+        ),
+        None,
+    )
+    if declared is None:
+        return None
+    relative_path = declared["relative_path"]
+    field_map = {
+        "camera_frame": "cam_frame",
+        "source_frame": "source_frame",
+        "absolute_frame": "absolute_frame",
+        "timestamp_seconds": "time_sec",
+        "distance_m": "dist_m",
+        "raw_distance_m": "dist_raw_m",
+        "smooth_distance_m": "dist_smooth_m",
+        "speed_mps": "speed_mps",
+        "acceleration_mps2": "accel_mps2",
+        "speed_mode_used": "speed_mode_used",
+        "pixel_distance_m": "dist_pixel_m",
+        "pixel_speed_mps": "speed_pixel_mps",
+        "pixel_acceleration_mps2": "accel_pixel_mps2",
+        "homography_distance_m": "dist_homography_m",
+        "homography_speed_mps": "speed_homography_mps",
+        "homography_acceleration_mps2": "accel_homography_mps2",
+        "image_point_x": "image_point_x",
+        "image_point_y": "image_point_y",
+        "interpolation_gap_length": "interp_gap_len",
+        "confidence": "speed_confidence",
+    }
+    fieldnames = [
+        "cam", "cam_frame", "source_frame", "absolute_frame", "time_sec", "time_s",
+        "dist_m", "dist_raw_m", "dist_smooth_m", "speed_mps", "accel_mps2",
+        "speed_mode_used", "dist_pixel_m", "speed_pixel_mps", "accel_pixel_mps2",
+        "dist_homography_m", "speed_homography_mps", "accel_homography_mps2",
+        "image_point_x", "image_point_y", "is_interpolated", "interp_gap_len",
+        "speed_confidence",
+    ]
+    try:
+        document = json.loads(artifacts_by_relative_path[relative_path])
+        frames = document["frames"]
+        if not isinstance(frames, list):
+            raise TypeError("frames must be an array")
+        output = io.StringIO(newline="")
+        writer = csv.DictWriter(output, fieldnames=fieldnames)
+        writer.writeheader()
+        for frame in frames:
+            timestamp = float(frame["timestamp_seconds"])
+            row = {
+                "cam": int(frame["camera_index"]) + 1,
+                "time_s": timestamp,
+                "is_interpolated": int(bool(frame["is_interpolated"])),
+            }
+            for source, destination in field_map.items():
+                row[destination] = frame.get(source)
+            row["time_sec"] = timestamp
+            writer.writerow(row)
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise HTTPException(
+            status_code=422,
+            detail=f"metrics JSON cannot be converted for result APIs: {error}",
         ) from error
     return output.getvalue().encode("utf-8")
 
@@ -409,8 +490,26 @@ async def ingest_analysis_run_manifest(
                 status_code=422,
                 detail=f"artifact {relative_path!r} size does not match the manifest",
             )
+        if declared["media_type"] == "application/json":
+            try:
+                artifact_document = json.loads(uploaded_bytes)
+                if not isinstance(artifact_document, dict):
+                    raise ContractValidationError("canonical artifact must be a JSON object")
+                validate_artifact_document(
+                    artifact_document,
+                    artifact_type=declared["type"],
+                )
+            except (json.JSONDecodeError, UnicodeDecodeError, ContractValidationError) as error:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"artifact {relative_path!r} is not valid contract v1 data: {error}",
+                ) from error
 
     derived_angles_csv = _local_angles_csv_bytes(
+        manifest_doc,
+        artifacts_by_relative_path,
+    )
+    derived_metrics_csv = _local_metrics_csv_bytes(
         manifest_doc,
         artifacts_by_relative_path,
     )
@@ -425,18 +524,20 @@ async def ingest_analysis_run_manifest(
         artifact_path.write_bytes(artifacts_by_relative_path[relative_path])
     if derived_angles_csv is not None:
         (result_dir / "angles.csv").write_bytes(derived_angles_csv)
+    if derived_metrics_csv is not None:
+        (result_dir / "metrics.csv").write_bytes(derived_metrics_csv)
 
     # Server uploads already use this canonical directory. Keeping Local input
     # videos in the same layout lets the playback endpoint serve them too.
     video_dir = RUN_SESSION_DIR / str(run_session.runner_id) / str(run_session.id)
     video_dir.mkdir(parents=True, exist_ok=True)
     for index, (upload, declared) in enumerate(
-        zip(uploaded_videos, manifest_doc["input_videos"]), start=1
+        zip(uploaded_videos, manifest_doc["input_videos"])
     ):
         suffix = Path(upload.filename or "").suffix
         if not suffix or len(suffix) > 10 or not suffix[1:].isalnum():
             suffix = ".mp4"
-        destination = video_dir / f"cam{index}{suffix}"
+        destination = video_dir / f"cam{index + 1}{suffix}"
         partial = destination.with_suffix(f"{destination.suffix}.part")
         digest = hashlib.sha256()
         with partial.open("wb") as output:
@@ -447,9 +548,27 @@ async def ingest_analysis_run_manifest(
             partial.unlink(missing_ok=True)
             raise HTTPException(
                 status_code=422,
-                detail=f"input video {index} content does not match the manifest sha256",
+                detail=f"input video {index + 1} content does not match the manifest sha256",
             )
         partial.replace(destination)
+        existing_video = (
+            await session.execute(
+                select(Video).where(
+                    Video.run_session_id == run_session.id,
+                    Video.camera_index == index,
+                )
+            )
+        ).scalars().first()
+        if existing_video is None:
+            session.add(
+                Video(
+                    run_session_id=run_session.id,
+                    camera_index=index,
+                    video_path=str(destination),
+                )
+            )
+        else:
+            existing_video.video_path = str(destination)
 
     manifest_status = manifest_doc["status"]
     run.status = manifest_status if manifest_status in ("completed", "degraded") else "failed"

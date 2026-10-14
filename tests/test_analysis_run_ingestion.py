@@ -1,16 +1,19 @@
 import asyncio
+import csv
 import hashlib
 import json
 from datetime import datetime, timezone
 from io import BytesIO
+from pathlib import Path
 from uuid import uuid4
 
-from fastapi import HTTPException, UploadFile
+from fastapi import HTTPException, Response, UploadFile
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlmodel import SQLModel
+import pytest
 
-from db_models import AnalysisMeta, AnalysisRun, ComparisonReport, Runner, RunSession, User
+from db_models import AnalysisMeta, AnalysisRun, ComparisonReport, Runner, RunSession, User, Video
 from response_chemas import CreateLocalAnalysisRunIn
 from routes.analysis_run import (
     create_local_analysis_run,
@@ -19,7 +22,14 @@ from routes.analysis_run import (
     ingest_analysis_run_manifest,
     submit_comparison_report,
 )
-from routes.run import get_run_session_angles, get_run_session_info, get_run_session_video
+from routes.run import (
+    get_run_session_angles,
+    get_run_session_graphs,
+    get_run_session_info,
+    get_run_session_video,
+)
+from routes.trial_review import get_run_session_camera_video, get_run_session_steps
+from utils.contract_v1 import ContractValidationError, validate_artifact_document
 
 JOINT_ORDER = [
     "nose", "left_eye", "right_eye", "left_ear", "right_ear", "left_shoulder",
@@ -28,6 +38,17 @@ JOINT_ORDER = [
     "left_big_toe", "left_small_toe", "left_heel", "right_big_toe", "right_small_toe",
     "right_heel",
 ]
+
+
+def test_canonical_artifact_validation_rejects_schema_mismatch():
+    with pytest.raises(ContractValidationError):
+        validate_artifact_document(
+            {
+                "schema_version": "1.0.0",
+                "frames": [{"speed_mps": "not-a-number"}],
+            },
+            artifact_type="metrics",
+        )
 
 
 def _valid_manifest(*, compute_location="local", camera_count=1, artifacts=None, status="completed"):
@@ -64,6 +85,10 @@ def _valid_manifest(*, compute_location="local", camera_count=1, artifacts=None,
             "detected_steps": 14,
             "average_cadence_spm": 281.5,
             "average_step_length_m": 1.85,
+            "maximum_speed_mps": 9.7,
+            "official_jump_distance_m": None,
+            "takeoff_speed_mps": None,
+            "flight_time_seconds": None,
         },
         "artifacts": artifacts or [],
         "warnings": [],
@@ -250,6 +275,33 @@ def test_local_ingestion_stores_source_video_for_run_session_playback(tmp_path, 
             expected_overlay = tmp_path / str(created.runSessionId) / "local" / "overlay/main.mp4"
             assert response.path == expected_overlay
 
+            camera_response = await get_run_session_camera_video(
+                created.runSessionId,
+                camera_index=0,
+                session=session,
+            )
+            assert camera_response.path == expected_overlay
+
+            steps_response = await get_run_session_steps(
+                created.runSessionId,
+                response=Response(),
+                session=session,
+            )
+            assert steps_response == {
+                "avgStepLengthM": None,
+                "avgCadenceSpm": None,
+                "steps": [],
+                "runwayWidthByCam": None,
+            }
+
+            video = (
+                await session.execute(
+                    select(Video).where(Video.run_session_id == created.runSessionId)
+                )
+            ).scalars().one()
+            assert video.camera_index == 0
+            assert Path(video.video_path) == expected
+
         await engine.dispose()
 
     asyncio.run(scenario())
@@ -315,6 +367,94 @@ def test_local_angles_json_is_available_through_existing_result_api(tmp_path, mo
             assert response["samples"][0]["frame"] == 0
             assert response["samples"][0]["timeSec"] == 0.2
             assert response["samples"][0]["values"]["left_knee_angle"] == 50.0
+
+        await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_local_metrics_json_is_available_through_existing_graph_api(tmp_path, monkeypatch):
+    import routes.analysis_run as analysis_run_module
+
+    monkeypatch.setattr(analysis_run_module, "RUN_SESSION_DIR", tmp_path)
+
+    async def scenario():
+        engine = await _make_engine()
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with session_factory() as session:
+            user, runner = await _setup_runner_and_user(session)
+            created = await create_local_analysis_run(
+                CreateLocalAnalysisRunIn(runnerId=runner.id, cameraCount=1, fps=60),
+                session=session,
+                current_user=user,
+            )
+            metrics_doc = {
+                "schema_version": "1.0.0",
+                "frames": [
+                    {
+                        "camera_index": 0,
+                        "camera_frame": 0,
+                        "source_frame": 12,
+                        "absolute_frame": 0,
+                        "timestamp_seconds": 0.2,
+                        "distance_m": 1.2,
+                        "raw_distance_m": 1.1,
+                        "smooth_distance_m": 1.2,
+                        "speed_mps": 7.5,
+                        "acceleration_mps2": 2.1,
+                        "speed_mode_used": "homography",
+                        "pixel_distance_m": 1.0,
+                        "pixel_speed_mps": 7.0,
+                        "pixel_acceleration_mps2": 2.0,
+                        "homography_distance_m": 1.2,
+                        "homography_speed_mps": 7.5,
+                        "homography_acceleration_mps2": 2.1,
+                        "image_point_x": 320.0,
+                        "image_point_y": 800.0,
+                        "is_interpolated": False,
+                        "interpolation_gap_length": 0,
+                        "confidence": 1.0,
+                    }
+                ],
+            }
+            metrics_bytes = json.dumps(metrics_doc).encode()
+            artifact = {
+                "artifact_id": str(uuid4()),
+                "type": "metrics",
+                "media_type": "application/json",
+                "relative_path": "metrics.json",
+                "sha256": hashlib.sha256(metrics_bytes).hexdigest(),
+                "size_bytes": len(metrics_bytes),
+            }
+            manifest_doc = _valid_manifest(artifacts=[artifact], status="degraded")
+
+            await ingest_analysis_run_manifest(
+                created.analysisRunId,
+                manifest=UploadFile(
+                    file=BytesIO(json.dumps(manifest_doc).encode()),
+                    filename="manifest.json",
+                ),
+                artifacts=[UploadFile(file=BytesIO(metrics_bytes), filename="metrics.json")],
+                idempotency_key="metrics-json-1",
+                session=session,
+                current_user=user,
+            )
+
+            derived_csv = tmp_path / str(created.runSessionId) / "local" / "metrics.csv"
+            assert derived_csv.exists()
+            rows = list(csv.DictReader(derived_csv.open()))
+            assert rows[0]["dist_smooth_m"] == "1.2"
+            assert rows[0]["speed_mps"] == "7.5"
+            assert rows[0]["accel_mps2"] == "2.1"
+            assert rows[0]["time_sec"] == "0.2"
+            graphs = await get_run_session_graphs(
+                created.runSessionId,
+                session=session,
+                current_user=user,
+            )
+            assert {graph["title"] for graph in graphs} == {
+                "Distance", "Velocity", "Acceleration",
+            }
 
         await engine.dispose()
 

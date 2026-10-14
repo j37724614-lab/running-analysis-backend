@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.session import get_session
 from db_models import Video
-from config import PIPELINE_ROOT
+from config import PIPELINE_ROOT, RUN_SESSION_DIR
 from response_chemas import StepsOut, ToePathOut
 from routes.run import _get_run_session, _session_dir, _analysis_csvs, _with_time_column
 
@@ -40,30 +40,40 @@ async def get_run_session_camera_video(
     camera_index: int,
     session: AsyncSession = Depends(get_session),
 ) -> FileResponse:
+    run_session = await _get_run_session(run_session_id, session)
+    session_dir = _session_dir(run_session)
+    no_cache_headers = {"Cache-Control": "no-store"}
+
+    # A Local bundle stores its rendered result as overlay/main.mp4 and may
+    # predate creation of a Video database row. Prefer that artifact so Local
+    # sessions remain reviewable without Server-style camN_overlay.mp4 files.
+    local_overlay = session_dir / "overlay" / "main.mp4"
+    if camera_index == 0 and local_overlay.exists():
+        return FileResponse(local_overlay, headers=no_cache_headers)
+
+    server_overlay = session_dir / f"cam{camera_index + 1}_overlay.mp4"
+    if server_overlay.exists():
+        return FileResponse(server_overlay, headers=no_cache_headers)
+
     stmt = select(Video).where(
         Video.run_session_id == run_session_id,
         Video.camera_index == camera_index,
     )
     video = (await session.execute(stmt)).scalars().first()
-    if not video or not video.video_path or not Path(video.video_path).exists():
-        raise HTTPException(status_code=404, detail="Camera video not found")
+    if video and video.video_path and Path(video.video_path).exists():
+        return FileResponse(Path(video.video_path), headers=no_cache_headers)
 
-    # Prefer the skeleton + landing-point overlay rendered by
-    # overlay_videos_per_camera() (core/overlay.py) if this session was
-    # analyzed after that feature was added; older sessions won't have it,
-    # so fall back to the raw camera footage.
-    #
-    # no-store: this same URL can start returning different bytes over time
-    # (raw footage -> overlay, once a backfill/re-analysis runs), and browsers
-    # cache <video> sources aggressively by URL even across reloads. Without
-    # this, a browser that loaded the URL before a backfill can keep playing
-    # the stale cached copy indefinitely.
-    no_cache_headers = {"Cache-Control": "no-store"}
-    run_session = await _get_run_session(run_session_id, session)
-    overlay_path = _session_dir(run_session) / f"cam{camera_index + 1}_overlay.mp4"
-    if overlay_path.exists():
-        return FileResponse(overlay_path, headers=no_cache_headers)
-    return FileResponse(Path(video.video_path), headers=no_cache_headers)
+    # Backward compatibility for Local sessions ingested before Video rows
+    # were persisted. Their source clips already live in this canonical path.
+    source_dir = RUN_SESSION_DIR / str(run_session.runner_id) / str(run_session.id)
+    source_matches = sorted(
+        path for path in source_dir.glob(f"cam{camera_index + 1}.*")
+        if path.is_file() and not path.name.endswith(".part")
+    )
+    if source_matches:
+        return FileResponse(source_matches[0], headers=no_cache_headers)
+
+    raise HTTPException(status_code=404, detail="Camera video not found")
 
 
 @router.get("/run_session/{run_session_id}/topdown_review")
@@ -136,6 +146,15 @@ async def get_run_session_steps(
     session_dir = _session_dir(run_session)
     steps_csv = _step_events_csv(session_dir)
     if not steps_csv:
+        # Local contract-v1 currently has no gait/step artifact. Treat that as
+        # an unavailable optional chart, while keeping its overlay reviewable.
+        if (session_dir / "manifest.json").exists():
+            return {
+                "avgStepLengthM": None,
+                "avgCadenceSpm": None,
+                "steps": [],
+                "runwayWidthByCam": None,
+            }
         raise HTTPException(status_code=404, detail="Step events file not found")
 
     df = pd.read_csv(steps_csv)
@@ -164,6 +183,36 @@ async def get_run_session_steps(
             df["speed_mps"] = np.nan
     else:
         df["speed_mps"] = np.nan
+
+    # Camera calibration metadata, independent of metrics.csv: each camera's
+    # own 6-point anchors carry the operator's own runway-width measurement
+    # (AnchorResult.runwayWidthM on the frontend) as the spread between its
+    # anchors' world_y_m values -- the exact number typed in during
+    # calibration, not an approximation of where feet happened to land.
+    videos_stmt = select(Video).where(Video.run_session_id == run_session_id)
+    videos = list((await session.execute(videos_stmt)).scalars().all())
+    controls = _camera_world_controls(videos)
+    runway_width_by_cam = {
+        cam: float(control[:, 1].max() - control[:, 1].min())
+        for cam, control in controls.items()
+    }
+
+    # Cross-camera alignment: each step's world_x_m comes from that camera's
+    # own independent homography (ankle_step_stride.py's _build_step_events),
+    # so calibration error drifts differently per camera and a step can land
+    # at the wrong relative position across a camera handoff. Align each
+    # camera's world_x_m the same way get_run_session_trajectory does,
+    # using metrics.csv's continuously-tracked dist_m as the common reference.
+    required_offset_cols = {"cam", "absolute_frame", "dist_m", "image_point_x", "image_point_y"}
+    if metrics_csv and required_offset_cols.issubset(speed_df.columns):
+        homographies = _camera_homographies(videos)
+        if homographies and set(controls) == set(homographies):
+            camera_offsets = _compute_camera_offsets(speed_df, homographies, controls)
+            cam_values = pd.to_numeric(df["cam"], errors="coerce")
+            offset_values = cam_values.map(
+                lambda value: camera_offsets.get(int(value)) if pd.notna(value) else None
+            )
+            df["world_x_m"] = pd.to_numeric(df["world_x_m"], errors="coerce") + offset_values.fillna(0.0)
 
     # ``time_s`` in the step-event CSV is local to each camera clip, whereas
     # metrics.csv uses the stitched timeline.  A nearest-time join therefore
@@ -253,6 +302,7 @@ async def get_run_session_steps(
         "avgStepLengthM": avg_step_length,
         "avgCadenceSpm": avg_cadence,
         "steps": steps,
+        "runwayWidthByCam": runway_width_by_cam or None,
     }
 
 
@@ -322,6 +372,57 @@ def _camera_world_controls(videos: list[Video]) -> dict[int, np.ndarray]:
     return controls
 
 
+def _compute_camera_offsets(
+    metrics: pd.DataFrame,
+    homographies: dict[int, np.ndarray],
+    controls: dict[int, np.ndarray],
+) -> dict[int, float]:
+    """Per-camera along-track offset that aligns each camera's independently
+    calibrated homography X axis with the continuously tracked (cross-camera)
+    distance in metrics.csv's ``dist_m`` column.
+
+    Each camera is calibrated from its own 6 anchor points, so calibration
+    error accumulates independently per camera and its local homography X
+    axis drifts relative to the other cameras. ``dist_m`` comes from
+    continuous pixel-based tracking that never resets at a camera handoff, so
+    the median difference between it and a camera's local homography X gives
+    that camera's drift -- the same reconciliation
+    scripts/tools/render_schematic_topdown_review.py performs for the
+    pipeline's own topdown review video.
+    """
+    offset_samples: dict[int, list[float]] = {index: [] for index in homographies}
+    for _, row in metrics.iterrows():
+        camera_index = int(row["cam"]) - 1
+        homography = homographies.get(camera_index)
+        if homography is None:
+            continue
+        values = [row.get("dist_m"), row.get("image_point_x"), row.get("image_point_y")]
+        if not all(pd.notna(value) and np.isfinite(float(value)) for value in values):
+            continue
+        local_x, _ = _transform_homography(
+            (float(row["image_point_x"]), float(row["image_point_y"])),
+            homography,
+        )
+        if not np.isfinite(local_x):
+            continue
+        offset_samples[camera_index].append(float(row["dist_m"]) - float(local_x))
+
+    camera_offsets: dict[int, float] = {}
+    fallback_x = 0.0
+    for camera_index in sorted(controls):
+        world = controls[camera_index]
+        local_min_x = float(world[:, 0].min())
+        local_max_x = float(world[:, 0].max())
+        samples = offset_samples.get(camera_index, [])
+        camera_offsets[camera_index] = (
+            float(np.median(np.asarray(samples, dtype=np.float64)))
+            if samples
+            else fallback_x - local_min_x
+        )
+        fallback_x += local_max_x - local_min_x
+    return camera_offsets
+
+
 @router.get("/run_session/{run_session_id}/trajectory")
 async def get_run_session_trajectory(
     run_session_id: UUID,
@@ -352,8 +453,9 @@ async def get_run_session_trajectory(
     if not homographies or set(controls) != set(homographies):
         raise HTTPException(status_code=404, detail="Complete 6-point Homography not found")
 
+    camera_offsets = _compute_camera_offsets(metrics, homographies, controls)
+
     projected_rows = []
-    offset_samples: dict[int, list[float]] = {index: [] for index in homographies}
     for _, row in metrics.sort_values("absolute_frame").iterrows():
         camera_index = int(row["cam"]) - 1
         homography = homographies.get(camera_index)
@@ -369,22 +471,7 @@ async def get_run_session_trajectory(
         if not np.isfinite(local_x) or not np.isfinite(world_y):
             continue
         global_x = float(row["dist_m"])
-        offset_samples[camera_index].append(global_x - float(local_x))
         projected_rows.append((row, camera_index, global_x, float(world_y)))
-
-    camera_offsets: dict[int, float] = {}
-    fallback_x = 0.0
-    for camera_index in sorted(controls):
-        world = controls[camera_index]
-        local_min_x = float(world[:, 0].min())
-        local_max_x = float(world[:, 0].max())
-        samples = offset_samples[camera_index]
-        camera_offsets[camera_index] = (
-            float(np.median(np.asarray(samples, dtype=np.float64)))
-            if samples
-            else fallback_x - local_min_x
-        )
-        fallback_x += local_max_x - local_min_x
 
     fps = float(run_session.fps or 60)
     cadence_events = []
