@@ -507,6 +507,104 @@ def test_degraded_local_manifest_is_preserved_as_usable_result(tmp_path, monkeyp
     asyncio.run(scenario())
 
 
+def test_local_steps_json_populates_trial_review(tmp_path, monkeypatch):
+    import routes.analysis_run as analysis_run_module
+
+    monkeypatch.setattr(analysis_run_module, "RUN_SESSION_DIR", tmp_path)
+
+    async def scenario():
+        engine = await _make_engine()
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with session_factory() as session:
+            user, runner = await _setup_runner_and_user(session)
+            created = await create_local_analysis_run(
+                CreateLocalAnalysisRunIn(runnerId=runner.id, cameraCount=1, fps=60),
+                session=session,
+                current_user=user,
+            )
+            steps_doc = {
+                "schema_version": "1.0.0",
+                "average_step_length_m": 1.2,
+                "average_stride_length_m": 2.4,
+                "average_cadence_spm": 240.0,
+                "steps": [
+                    {
+                        "step_index": 1,
+                        "event_type": "step",
+                        "foot": "left",
+                        "camera_index": 0,
+                        "source_frame": 12,
+                        "timestamp_seconds": 0.2,
+                        "world_x_m": 1.0,
+                        "world_y_m": 0.4,
+                        "step_length_m": None,
+                        "stride_length_m": None,
+                        "contact_time_seconds": 0.1,
+                        "speed_mps": 7.0,
+                        "confidence": 0.9,
+                    },
+                    {
+                        "step_index": 2,
+                        "event_type": "step",
+                        "foot": "right",
+                        "camera_index": 0,
+                        "source_frame": 27,
+                        "timestamp_seconds": 0.45,
+                        "world_x_m": 2.2,
+                        "world_y_m": 0.4,
+                        "step_length_m": 1.2,
+                        "stride_length_m": None,
+                        "contact_time_seconds": 0.09,
+                        "speed_mps": 7.4,
+                        "confidence": 0.88,
+                    },
+                ],
+            }
+            steps_bytes = json.dumps(steps_doc).encode()
+            artifact = {
+                "artifact_id": str(uuid4()),
+                "type": "steps",
+                "media_type": "application/json",
+                "relative_path": "gait/steps.json",
+                "sha256": hashlib.sha256(steps_bytes).hexdigest(),
+                "size_bytes": len(steps_bytes),
+            }
+            manifest_doc = _valid_manifest(artifacts=[artifact], status="degraded")
+
+            await ingest_analysis_run_manifest(
+                created.analysisRunId,
+                manifest=UploadFile(
+                    file=BytesIO(json.dumps(manifest_doc).encode()),
+                    filename="manifest.json",
+                ),
+                artifacts=[UploadFile(file=BytesIO(steps_bytes), filename="gait/steps.json")],
+                idempotency_key="steps-json-1",
+                session=session,
+                current_user=user,
+            )
+
+            derived = tmp_path / str(created.runSessionId) / "local" / "local_step_events.csv"
+            assert derived.exists()
+            csv_rows = list(csv.DictReader(derived.open()))
+            assert csv_rows[1]["cadence_spm"] == "240.0"
+
+            response = Response()
+            result = await get_run_session_steps(
+                created.runSessionId,
+                response=response,
+                session=session,
+            )
+            assert result["avgStepLengthM"] == 1.2
+            assert result["avgCadenceSpm"] == 240.0
+            assert len(result["steps"]) == 2
+            assert result["steps"][1]["stepLengthM"] == 1.2
+            assert result["steps"][1]["cadenceSpm"] == 240.0
+
+        await engine.dispose()
+
+    asyncio.run(scenario())
+
+
 def test_ingest_manifest_rejects_camera_count_mismatch(tmp_path, monkeypatch):
     import routes.analysis_run as analysis_run_module
 

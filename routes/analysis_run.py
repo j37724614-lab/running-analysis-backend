@@ -184,6 +184,73 @@ def _local_metrics_csv_bytes(
     return output.getvalue().encode("utf-8")
 
 
+def _local_steps_csv_bytes(
+    manifest_doc: dict,
+    artifacts_by_relative_path: dict[str, bytes],
+) -> bytes | None:
+    """Convert canonical Local steps JSON for the existing trial-review API."""
+    declared = next(
+        (
+            artifact
+            for artifact in manifest_doc.get("artifacts", [])
+            if artifact.get("type") == "steps"
+            and artifact.get("media_type") == "application/json"
+        ),
+        None,
+    )
+    if declared is None:
+        return None
+    relative_path = declared["relative_path"]
+    fieldnames = [
+        "step_index", "seq_frame", "orig_frame", "time_s", "seq_time_s",
+        "cam", "foot", "event_type", "world_x_m", "world_y_m",
+        "step_length_m", "stride_length_m", "contact_time_seconds",
+        "cadence_spm", "avg_cadence_spm", "confidence",
+    ]
+    try:
+        document = json.loads(artifacts_by_relative_path[relative_path])
+        steps = document["steps"]
+        if not isinstance(steps, list):
+            raise TypeError("steps must be an array")
+        output = io.StringIO(newline="")
+        writer = csv.DictWriter(output, fieldnames=fieldnames)
+        writer.writeheader()
+        previous_time_by_camera: dict[int, float] = {}
+        for step in steps:
+            camera = int(step["camera_index"])
+            timestamp = float(step["timestamp_seconds"])
+            previous_time = previous_time_by_camera.get(camera)
+            cadence = None
+            if previous_time is not None and timestamp > previous_time:
+                cadence = 60.0 / (timestamp - previous_time)
+            previous_time_by_camera[camera] = timestamp
+            source_frame = int(step["source_frame"])
+            writer.writerow({
+                "step_index": int(step["step_index"]),
+                "seq_frame": source_frame,
+                "orig_frame": source_frame,
+                "time_s": timestamp,
+                "seq_time_s": timestamp,
+                "cam": camera,
+                "foot": step["foot"],
+                "event_type": step["event_type"],
+                "world_x_m": step.get("world_x_m"),
+                "world_y_m": step.get("world_y_m"),
+                "step_length_m": step.get("step_length_m"),
+                "stride_length_m": step.get("stride_length_m"),
+                "contact_time_seconds": step.get("contact_time_seconds"),
+                "cadence_spm": cadence,
+                "avg_cadence_spm": document.get("average_cadence_spm"),
+                "confidence": step["confidence"],
+            })
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise HTTPException(
+            status_code=422,
+            detail=f"steps JSON cannot be converted for trial review: {error}",
+        ) from error
+    return output.getvalue().encode("utf-8")
+
+
 async def generate_and_store_comparison_report(
     comparison_group_id: UUID,
     session: AsyncSession,
@@ -513,6 +580,10 @@ async def ingest_analysis_run_manifest(
         manifest_doc,
         artifacts_by_relative_path,
     )
+    derived_steps_csv = _local_steps_csv_bytes(
+        manifest_doc,
+        artifacts_by_relative_path,
+    )
 
     result_dir = RUN_SESSION_DIR / str(run_session.id) / run.compute_location
     result_dir.mkdir(parents=True, exist_ok=True)
@@ -526,6 +597,8 @@ async def ingest_analysis_run_manifest(
         (result_dir / "angles.csv").write_bytes(derived_angles_csv)
     if derived_metrics_csv is not None:
         (result_dir / "metrics.csv").write_bytes(derived_metrics_csv)
+    if derived_steps_csv is not None:
+        (result_dir / "local_step_events.csv").write_bytes(derived_steps_csv)
 
     # Server uploads already use this canonical directory. Keeping Local input
     # videos in the same layout lets the playback endpoint serve them too.

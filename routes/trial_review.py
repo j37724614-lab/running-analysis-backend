@@ -146,8 +146,8 @@ async def get_run_session_steps(
     session_dir = _session_dir(run_session)
     steps_csv = _step_events_csv(session_dir)
     if not steps_csv:
-        # Local contract-v1 currently has no gait/step artifact. Treat that as
-        # an unavailable optional chart, while keeping its overlay reviewable.
+        # Older Local bundles have no gait artifact. Treat it as an unavailable
+        # optional chart while keeping the overlay reviewable.
         if (session_dir / "manifest.json").exists():
             return {
                 "avgStepLengthM": None,
